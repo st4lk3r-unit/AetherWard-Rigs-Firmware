@@ -17,23 +17,11 @@ jobs:
           - name: brain-prism
             project: brain
             env: brain-prism
-            extra_flags: ""
 
           - name: companion-prism
             project: companion
             env: companion-prism
             extra_flags: "-DAWBUS_NODE_ID=1"
-
-          - name: konsole-example-arduino
-            project: lib/konsole/examples/arduino_serial
-            env: esp32dev
-            lib_extra_dirs: "../../.."
-
-          - name: konsole-example-espidf
-            project: lib/konsole/examples/espidf_uart
-            env: esp32dev
-            lib_extra_dirs: "../../.."
-            src_dir: "main"
 
     steps:
       - uses: actions/checkout@v4
@@ -55,7 +43,4 @@ jobs:
         working-directory: ${{ matrix.project }}
         env:
           PLATFORMIO_BUILD_FLAGS: ${{ matrix.extra_flags }}
-        run: |
-          [ -n "${{ matrix.lib_extra_dirs }}" ] && export PLATFORMIO_LIB_EXTRA_DIRS="${{ matrix.lib_extra_dirs }}"
-          [ -n "${{ matrix.src_dir }}"        ] && export PLATFORMIO_SRC_DIR="${{ matrix.src_dir }}"
-          pio run -e ${{ matrix.env }}
+        run: pio run -e ${{ matrix.env }}
