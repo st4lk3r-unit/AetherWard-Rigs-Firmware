@@ -4,6 +4,8 @@
 #include "driver/gpio.h"
 #include "companion.h"
 #include "board.h"
+#include "aw_wifi/wifi_proto.h"
+#include "wifi_sniff.h"
 
 #define TAG "companion"
 
@@ -136,7 +138,7 @@ static int handle_brain_frame(const awbus_frame_t *rx) {
 
     switch ((awbus_cmd_t)rx->cmd) {
     case AWBUS_CMD_NULL:
-        return 0;
+        return wifi_sniff_pop_pending(&g_bus);
 
     case AWBUS_CMD_PING:
         reply_cmd = AWBUS_CMD_PONG;
@@ -161,9 +163,46 @@ static int handle_brain_frame(const awbus_frame_t *rx) {
         return 0;
 
     case AWBUS_CMD_ACTION:
-        ESP_LOGI(TAG, "ACTION payload[0]=%d",
-                 rx->payload_len > 0 ? rx->payload[0] : 0);
-        return 0;
+        if (rx->payload_len < 1) return 0;
+        switch ((wifi_action_t)rx->payload[0]) {
+
+        case WIFI_ACTION_TIMESYNC:
+            if (rx->payload_len >= 9u) {
+                uint64_t brain_us = 0;
+                for (int i = 0; i < 8; i++)
+                    brain_us |= (uint64_t)rx->payload[1 + i] << (i * 8);
+                wifi_sniff_timesync(brain_us);
+            }
+            return 0;
+
+        case WIFI_ACTION_SNIFF_START: {
+            uint8_t n_ch = (rx->payload_len >= 3u) ? rx->payload[2] : 0u;
+            if (rx->payload_len < (uint16_t)(3u + n_ch + 2u)) return 0;
+            uint8_t  filter  = rx->payload[1];
+            const uint8_t *channels = &rx->payload[3];
+            uint16_t hop_ms  = (uint16_t)rx->payload[3 + n_ch]
+                             | ((uint16_t)rx->payload[4 + n_ch] << 8u);
+            wifi_sniff_start(channels, n_ch, filter, hop_ms);
+            return 0;
+        }
+
+        case WIFI_ACTION_SNIFF_STOP: {
+            wifi_sniff_stop();
+            /* Push telemetry immediately as the STOP reply */
+            uint8_t tbuf[WIFI_TELEMETRY_SIZE];
+            uint16_t tlen = wifi_sniff_telemetry(tbuf);
+            if (awbus_companion_push(&g_bus, AWBUS_CMD_DATA_PUSH, tbuf, tlen, NULL) == AWBUS_OK) {
+                awbus_companion_set_ready(&g_bus, 1);
+                return 1;
+            }
+            return 0;
+        }
+
+        default:
+            ESP_LOGW(TAG, "unknown ACTION subtype 0x%02x", rx->payload[0]);
+            return 0;
+        }
+        return 0;   /* all inner cases return; this silences fallthrough warnings */
 
     default:
         ESP_LOGW(TAG, "unknown cmd 0x%02x", rx->cmd);
@@ -197,6 +236,8 @@ int companion_init(const arch_api_t *arch) {
     }
     awbus_init(&g_bus, port, (uint8_t)AWBUS_NODE_ID);
 
+    wifi_sniff_init();
+
     ESP_LOGI(TAG, "aetherward-rig companion  node=%d  board=%s",
              AWBUS_NODE_ID, NEU_BOARD_NAME);
     return 0;
@@ -215,10 +256,11 @@ void companion_run(void) {
                 ESP_LOGW(TAG, "idle arm failed: %d", ar);
         }
     } else if (rc == AWBUS_ERR_NODATA) {
-        /* No completed SPI transaction yet — sleep until the ISR fires (or
-         * 10 ms for heartbeat).  The port does not re-arm here; re-arming only
-         * happens after the completed RX has been reaped and handled. */
-        awbus_companion_wait_frame(&g_bus, 10u);
+        /* Try to flush a pending WiFi blob.  If one was queued (READY raised),
+         * skip the wait so the brain can poll immediately.  Otherwise yield
+         * until the next SPI transaction or the 10 ms heartbeat timeout. */
+        if (!wifi_sniff_flush(&g_bus))
+            awbus_companion_wait_frame(&g_bus, 10u);
     } else {
         /* A bad/malformed frame was already reaped.  Re-arm idle RX so one
          * corrupted frame does not wedge the whole companion offline. */

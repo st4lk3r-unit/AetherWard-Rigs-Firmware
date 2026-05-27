@@ -1,6 +1,6 @@
 {
   "name": "aw-bus",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "AetherWard Bus — hardware-agnostic brain/companion protocol (C99)",
   "frameworks": ["arduino", "espidf", "native"],
   "platforms": ["espressif32", "native"],
