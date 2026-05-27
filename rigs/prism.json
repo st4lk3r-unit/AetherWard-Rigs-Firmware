@@ -1,0 +1,49 @@
+{
+  "rig": "prism",
+  "description": "PRISM — ESP32 brain + N × Seeed XIAO ESP32C6 companions on shared SPI",
+  "version": "0.1",
+
+  "brain": {
+    "label": "Brain",
+    "description": "ESP32 DevKit — SPI master, konsole interactive shell",
+    "project": "brain",
+    "env": "brain-prism",
+    "board": "esp32dev"
+  },
+
+  "companion": {
+    "label_prefix": "Companion",
+    "description": "XIAO ESP32C6 — SPI slave",
+    "project": "companion",
+    "env": "companion-prism",
+    "board": "seeed_xiao_esp32c6"
+  },
+
+  "companion_default_count": 3,
+
+  "pins": {
+    "brain": {
+      "spi_sck":        14,
+      "spi_mosi":       13,
+      "spi_miso":       27,
+      "reset":          21,
+      "reset_pulse_ms": 10,
+      "led":             2,
+
+      "companion_cs":    [15, 25,  4],
+      "companion_ready": [32, 33, 26]
+    },
+
+    "companion": {
+      "spi_sck":     19,
+      "spi_mosi":    18,
+      "spi_miso":    20,
+      "spi_cs":      21,
+      "ready":       22,
+      "reset":        2,
+      "wifi_enable":  3,
+      "ant":         14,
+      "led":         15
+    }
+  }
+}
