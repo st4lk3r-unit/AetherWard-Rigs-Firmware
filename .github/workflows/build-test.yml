@@ -1,0 +1,44 @@
+name: build
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: brain-prism
+            project: brain
+            env: brain-prism
+
+          - name: companion-prism
+            project: companion
+            env: companion-prism
+            extra_flags: "-DAWBUS_NODE_ID=1"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio/packages
+            ~/.platformio/platforms
+          key: pio-${{ matrix.env }}-${{ hashFiles(format('{0}/platformio.ini', matrix.project)) }}
+          restore-keys: pio-${{ matrix.env }}-
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build
+        working-directory: ${{ matrix.project }}
+        env:
+          PLATFORMIO_BUILD_FLAGS: ${{ matrix.extra_flags }}
+        run: pio run -e ${{ matrix.env }}

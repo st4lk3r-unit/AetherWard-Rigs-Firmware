@@ -1,0 +1,7 @@
+{
+  "name": "aw-wifi",
+  "version": "0.2.0",
+  "description": "AetherWard WiFi protocol definitions (header-only)",
+  "license": "MIT",
+  "headers": "include/aw_wifi/wifi_proto.h"
+}

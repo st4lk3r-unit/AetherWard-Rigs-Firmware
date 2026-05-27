@@ -8,7 +8,7 @@
    Both brain and companion must be compiled with the same value.
    Override with -DAWBUS_FRAME_SIZE=N in build flags. */
 #ifndef AWBUS_FRAME_SIZE
-#define AWBUS_FRAME_SIZE  260u
+#define AWBUS_FRAME_SIZE  1024u
 #endif
 
 #define AWBUS_HEADER_SIZE  8u
