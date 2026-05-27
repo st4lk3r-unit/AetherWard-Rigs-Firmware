@@ -1,4 +1,4 @@
-name: build-test
+name: build
 
 on:
   push:
@@ -17,6 +17,7 @@ jobs:
           - name: brain-prism
             project: brain
             env: brain-prism
+            extra_flags: ""
 
           - name: companion-prism
             project: companion
@@ -26,10 +27,13 @@ jobs:
           - name: konsole-example-arduino
             project: lib/konsole/examples/arduino_serial
             env: esp32dev
+            lib_extra_dirs: "../../.."
 
           - name: konsole-example-espidf
             project: lib/konsole/examples/espidf_uart
             env: esp32dev
+            lib_extra_dirs: "../../.."
+            src_dir: "main"
 
     steps:
       - uses: actions/checkout@v4
@@ -51,4 +55,8 @@ jobs:
         working-directory: ${{ matrix.project }}
         env:
           PLATFORMIO_BUILD_FLAGS: ${{ matrix.extra_flags }}
-        run: pio run -e ${{ matrix.env }}
+        run: |
+          OPTS=""
+          [ -n "${{ matrix.lib_extra_dirs }}" ] && OPTS="$OPTS --project-option lib_extra_dirs=${{ matrix.lib_extra_dirs }}"
+          [ -n "${{ matrix.src_dir }}"        ] && OPTS="$OPTS --project-option src_dir=${{ matrix.src_dir }}"
+          pio run -e ${{ matrix.env }} $OPTS
