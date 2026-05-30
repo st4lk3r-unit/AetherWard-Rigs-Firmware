@@ -1,5 +1,6 @@
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_wifi.h"
@@ -85,6 +86,10 @@ static volatile uint32_t s_flush_empty = 0;
 
 /* ---- Pending blob staged for the next NULL poll ---- */
 static volatile int s_blob_pending = 0;
+/* A blob can be staged by the Wi-Fi RX callback, where we do not have the
+ * awbus_t needed to raise READY.  The companion main loop sees this flag and
+ * asserts READY on the next pass. */
+static volatile int s_pending_needs_ready = 0;
 static int          s_pending_idx = 0;
 static uint16_t     s_pending_used = 0;
 static uint8_t      s_pending_nframes = 0;
@@ -108,6 +113,53 @@ static inline void wr64(uint8_t *p, uint64_t v) {
 static inline void bump_drop(volatile uint32_t *why) {
     (*why)++;
     s_dropped++;
+}
+
+/* Seal the current fill blob and swap to the other buffer.
+ * Caller must hold s_mutex and must ensure s_blob_pending == 0 and nf > 0.
+ * Returns 1 when a pending blob was staged. */
+static int seal_fill_locked(void) {
+    int fi = s_fill;
+    uint8_t nf = s_blob_nframes[fi];
+    uint16_t used = s_blob_used[fi];
+    if (nf == 0u || s_blob_pending) return 0;
+
+    uint32_t bseq = ++s_blob_seq;
+    uint32_t first_seq = s_blob_first_seq[fi];
+
+    s_blob[fi][0] = WIFI_DATA_SNIFF_BLOB;
+    s_blob[fi][1] = WIFI_PROTO_VERSION;
+    s_blob[fi][2] = (uint8_t)AWBUS_NODE_ID;
+    s_blob[fi][3] = nf;
+    s_blob[fi][4] = s_cur_channel;
+    s_blob[fi][5] = 0;
+    s_blob[fi][6] = WIFI_BLOB_HDR_SIZE;
+    s_blob[fi][7] = 0;
+    wr32(s_blob[fi] + 8, bseq);
+    wr32(s_blob[fi] + 12, first_seq);
+    wr16(s_blob[fi] + 16, used);
+    wr16(s_blob[fi] + 18, s_blob_used[fi ^ 1]);
+    wr32(s_blob[fi] + 20, s_dropped);
+
+    int next_idx = fi ^ 1;
+    s_blob_used[next_idx] = 0;
+    s_blob_nframes[next_idx] = 0;
+    s_blob_first_seq[next_idx] = 0;
+    s_fill = next_idx;
+
+    s_pending_idx = fi;
+    s_pending_used = used;
+    s_pending_nframes = nf;
+    s_blob_pending = 1;
+    s_pending_needs_ready = 1;
+
+    s_blob_flushes++;
+    if ((uint32_t)(WIFI_BLOB_HDR_SIZE + used) > s_max_blob_bytes)
+        s_max_blob_bytes = (uint32_t)(WIFI_BLOB_HDR_SIZE + used);
+    if ((uint32_t)nf > s_max_blob_frames)
+        s_max_blob_frames = nf;
+
+    return 1;
 }
 
 static void reset_stats(void) {
@@ -233,40 +285,71 @@ static void wifi_rx_cb(void *buf, wifi_promiscuous_pkt_type_t pkt_type) {
         return;
     }
 
-    int fi = s_fill;
-    if (s_blob_nframes[fi] >= 255u) {
-        xSemaphoreGive(s_mutex);
-        bump_drop(&s_drop_record_limit);
-        return;
-    }
-    if (WIFI_BLOB_HDR_SIZE + s_blob_used[fi] + needed > BLOB_BUF_SIZE) {
+    if (WIFI_BLOB_HDR_SIZE + needed > BLOB_BUF_SIZE) {
         xSemaphoreGive(s_mutex);
         bump_drop(&s_drop_blob_full);
         return;
     }
 
-    if (s_blob_nframes[fi] == 0u)
-        s_blob_first_seq[fi] = frame_seq;
+    /* Try at most twice: if the active blob is full, seal/swap it and retry
+     * this same frame in the fresh fill buffer.  Before this patch, the first
+     * overflow simply dropped the frame, producing blobF == drop even when the
+     * bus was otherwise healthy. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        int fi = s_fill;
+        int rec_limit = (s_blob_nframes[fi] >= 255u);
+        int no_room = (WIFI_BLOB_HDR_SIZE + s_blob_used[fi] + needed > BLOB_BUF_SIZE);
 
-    uint8_t *p = s_blob[fi] + WIFI_BLOB_HDR_SIZE + s_blob_used[fi];
-    wr64(p + 0, ts_us);
-    wr32(p + 8, frame_seq);
-    wr16(p + 12, captured_len);
-    wr16(p + 14, frame_len);
-    p[16] = ch;
-    p[17] = (uint8_t)rssi;
-    p[18] = fc0;
-    p[19] = rec_flags;
-    memcpy(p + WIFI_RECORD_HDR_SIZE, frame, captured_len);
+        if (rec_limit || no_room) {
+            if (s_blob_nframes[fi] == 0u) {
+                xSemaphoreGive(s_mutex);
+                if (rec_limit) bump_drop(&s_drop_record_limit);
+                else bump_drop(&s_drop_blob_full);
+                return;
+            }
 
-    s_blob_used[fi] = (uint16_t)(s_blob_used[fi] + needed);
-    s_blob_nframes[fi]++;
-    s_captured++;
+            if (s_blob_pending) {
+                xSemaphoreGive(s_mutex);
+                bump_drop(&s_drop_pending_busy);
+                return;
+            }
 
-    if ((uint32_t)s_blob_used[fi] > s_max_fill_bytes) s_max_fill_bytes = s_blob_used[fi];
-    if ((uint32_t)s_blob_nframes[fi] > s_max_fill_frames) s_max_fill_frames = s_blob_nframes[fi];
+            if (!seal_fill_locked()) {
+                xSemaphoreGive(s_mutex);
+                bump_drop(rec_limit ? &s_drop_record_limit : &s_drop_blob_full);
+                return;
+            }
+            s_flush_full_fires++;
+            continue;
+        }
+
+        if (s_blob_nframes[fi] == 0u)
+            s_blob_first_seq[fi] = frame_seq;
+
+        uint8_t *p = s_blob[fi] + WIFI_BLOB_HDR_SIZE + s_blob_used[fi];
+        wr64(p + 0, ts_us);
+        wr32(p + 8, frame_seq);
+        wr16(p + 12, captured_len);
+        wr16(p + 14, frame_len);
+        p[16] = ch;
+        p[17] = (uint8_t)rssi;
+        p[18] = fc0;
+        p[19] = rec_flags;
+        memcpy(p + WIFI_RECORD_HDR_SIZE, frame, captured_len);
+
+        s_blob_used[fi] = (uint16_t)(s_blob_used[fi] + needed);
+        s_blob_nframes[fi]++;
+        s_captured++;
+
+        if ((uint32_t)s_blob_used[fi] > s_max_fill_bytes) s_max_fill_bytes = s_blob_used[fi];
+        if ((uint32_t)s_blob_nframes[fi] > s_max_fill_frames) s_max_fill_frames = s_blob_nframes[fi];
+
+        xSemaphoreGive(s_mutex);
+        return;
+    }
 
     xSemaphoreGive(s_mutex);
+    bump_drop(&s_drop_blob_full);
 }
 
 void wifi_sniff_init(void) {
@@ -317,6 +400,7 @@ void wifi_sniff_start(const uint8_t *channels, uint8_t n_ch,
     xSemaphoreGive(s_mutex);
 
     s_blob_pending = 0;
+    s_pending_needs_ready = 0;
     s_pending_idx = 0;
     s_pending_used = 0;
     s_pending_nframes = 0;
@@ -368,6 +452,11 @@ void wifi_sniff_stop(void) {
 int wifi_sniff_flush(awbus_t *bus) {
     if (s_blob_pending) {
         s_blob_pending_seen++;
+        if (s_pending_needs_ready) {
+            s_pending_needs_ready = 0;
+            awbus_companion_set_ready(bus, 1);
+            return 1;
+        }
         if (s_flush_due) s_drop_pending_busy++;
         return 0;
     }
@@ -377,62 +466,27 @@ int wifi_sniff_flush(awbus_t *bus) {
     uint8_t  nf       = s_blob_nframes[fi];
     uint16_t used     = s_blob_used[fi];
     int      buf_full = (WIFI_BLOB_HDR_SIZE + used >= BLOB_FLUSH_THRESHOLD);
-    xSemaphoreGive(s_mutex);
 
     if (buf_full) s_flush_full_fires++;
     if (nf == 0u) {
         if (s_flush_due) s_flush_empty++;
         s_flush_due = 0;
+        xSemaphoreGive(s_mutex);
         return 0;
     }
-    if (!s_flush_due && !buf_full) return 0;
+    if (!s_flush_due && !buf_full) {
+        xSemaphoreGive(s_mutex);
+        return 0;
+    }
     s_flush_due = 0;
 
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    fi   = s_fill;
-    nf   = s_blob_nframes[fi];
-    used = s_blob_used[fi];
-    if (nf == 0u) {
-        xSemaphoreGive(s_mutex);
+    if (!seal_fill_locked()) {
         s_flush_empty++;
+        xSemaphoreGive(s_mutex);
         return 0;
     }
-
-    uint32_t bseq = ++s_blob_seq;
-    uint32_t first_seq = s_blob_first_seq[fi];
-
-    s_blob[fi][0] = WIFI_DATA_SNIFF_BLOB;
-    s_blob[fi][1] = WIFI_PROTO_VERSION;
-    s_blob[fi][2] = (uint8_t)AWBUS_NODE_ID;
-    s_blob[fi][3] = nf;
-    s_blob[fi][4] = s_cur_channel;
-    s_blob[fi][5] = 0;
-    s_blob[fi][6] = WIFI_BLOB_HDR_SIZE;
-    s_blob[fi][7] = 0;
-    wr32(s_blob[fi] + 8, bseq);
-    wr32(s_blob[fi] + 12, first_seq);
-    wr16(s_blob[fi] + 16, used);
-    wr16(s_blob[fi] + 18, s_blob_used[fi ^ 1]);
-    wr32(s_blob[fi] + 20, s_dropped);
-
-    int flush_idx = fi;
-    int next_idx  = fi ^ 1;
-    s_blob_used[next_idx] = 0;
-    s_blob_nframes[next_idx] = 0;
-    s_blob_first_seq[next_idx] = 0;
-    s_fill = next_idx;
+    s_pending_needs_ready = 0;
     xSemaphoreGive(s_mutex);
-
-    s_pending_idx = flush_idx;
-    s_pending_used = used;
-    s_pending_nframes = nf;
-    s_blob_pending = 1;
-
-    s_blob_flushes++;
-    if ((uint32_t)(WIFI_BLOB_HDR_SIZE + used) > s_max_blob_bytes)
-        s_max_blob_bytes = (uint32_t)(WIFI_BLOB_HDR_SIZE + used);
-    if ((uint32_t)nf > s_max_blob_frames)
-        s_max_blob_frames = nf;
 
     awbus_companion_set_ready(bus, 1);
     return 1;
@@ -441,6 +495,7 @@ int wifi_sniff_flush(awbus_t *bus) {
 int wifi_sniff_pop_pending(awbus_t *bus) {
     if (!s_blob_pending) return 0;
     s_blob_pending = 0;
+    s_pending_needs_ready = 0;
 
     uint16_t total = (uint16_t)(WIFI_BLOB_HDR_SIZE + s_pending_used);
     int rc = awbus_companion_push(bus, AWBUS_CMD_DATA_PUSH,
