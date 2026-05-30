@@ -10,6 +10,12 @@ extern void brain_heartbeat_tick(void);
 #endif
 
 #define PROBE_INTERVAL_MS  3000u
+#define PROBE_FAIL_LIMIT    3u
+#define POST_SNIFF_PROBE_GRACE_MS 10000u
+#define RECENT_SEEN_SKIP_MS 5000u
+#define CONTROL_REPLY_TIMEOUT_MS 1000u
+#define CONTROL_RESEND_MS 80u
+#define CONTROL_PUMP_MS 5u
 
 extern awbus_port_t *brain_bus_port_init(void);
 
@@ -18,7 +24,10 @@ static struct konsole        g_ks;
 static struct kon_line_state g_line;
 static awbus_t               g_bus;
 static uint8_t               s_online[AWBUS_COMPANION_COUNT + 1]; /* 1-indexed */
+static uint8_t               s_probe_fail[AWBUS_COMPANION_COUNT + 1];
+static uint32_t              s_last_seen_ms[AWBUS_COMPANION_COUNT + 1];
 static uint32_t              s_last_probe_ms;
+static uint32_t              s_probe_pause_until_ms;
 
 /* ---- keyboard ring ---- */
 #define KBD_BUF 32
@@ -56,36 +65,204 @@ static uint32_t io_millis(void *ctx) {
     return ((struct io_ctx *)ctx)->A->millis();
 }
 
+static int time_reached(uint32_t now, uint32_t deadline) {
+    return (int32_t)(now - deadline) >= 0;
+}
+
+static uint32_t age_ms(uint32_t now, uint32_t then) {
+    return (uint32_t)(now - then);
+}
+
+static void mark_companion_seen(uint8_t id) {
+    if (id < 1u || id > AWBUS_COMPANION_COUNT) return;
+
+    uint8_t was_online = s_online[id];
+    uint8_t old_fail = s_probe_fail[id];
+
+    s_probe_fail[id] = 0u;
+    s_online[id] = 1u;
+    s_last_seen_ms[id] = A ? A->millis() : 0u;
+
+    /* Centralized live transition logging. Earlier fixes intentionally
+     * suppressed NULL spam, but this made a node recovery through riginfo,
+     * async poll, or any robust control reply silent. Log only real state
+     * transitions or recovery from suspect state, never every valid frame. */
+    if (was_online == 0u) {
+        kon_printf(&g_ks, "[bus] companion %u online\r\n", (unsigned)id);
+    } else if (old_fail != 0u) {
+        kon_printf(&g_ks, "[bus] companion %u recovered: probe ok after %u/%u\r\n",
+                   (unsigned)id, (unsigned)old_fail, (unsigned)PROBE_FAIL_LIMIT);
+    }
+}
+
+static int mark_companion_probe_result(uint8_t id, int ok) {
+    if (id < 1u || id > AWBUS_COMPANION_COUNT) return 0;
+    if (ok) {
+        int changed = !s_online[id];
+        s_online[id] = 1;
+        s_probe_fail[id] = 0;
+        return changed ? 1 : 0;
+    }
+
+    if (!s_online[id]) {
+        s_probe_fail[id] = PROBE_FAIL_LIMIT;
+        return 0;
+    }
+
+    if (s_probe_fail[id] < 255u)
+        s_probe_fail[id]++;
+
+    if (s_probe_fail[id] >= PROBE_FAIL_LIMIT) {
+        s_online[id] = 0;
+        return -1;
+    }
+
+    /* A valid node can miss a probe right after sniffing because stale async
+     * DATA_PUSH/NULL traffic may still be settling. Keep it online until the
+     * failure repeats. */
+    return 0;
+}
+
 /* ---- companion presence ---- */
 
 /*
- * Send `cmd` to `id`, busy-wait up to 50 ms for a reply with `expect_cmd`.
- * rx_out receives the companion frame; pass NULL to discard.
- * Returns AWBUS_OK, AWBUS_ERR_TIMEOUT, or AWBUS_ERR_CRC.
+ * Send `cmd` to `id` and wait for `expect_cmd`.
+ *
+ * The bus is full-duplex and companions can have async DATA_PUSH/NULL frames
+ * staged before a control request. A strict "one command, next READY must be
+ * the response" probe is unsafe after sniffing: it can read a stale
+ * sniff/telemetry/NULL frame, decide it is not PONG/INFO, and falsely mark the
+ * node offline.
+ *
+ * Robust behaviour: send the request, then drain READY frames until the wanted
+ * response appears or the timeout expires. Valid but unrelated frames are
+ * ignored here; the sniff command has its own DATA_PUSH drain/parser.
+ */
+static int is_stale_async_cmd(uint8_t cmd) {
+    return cmd == AWBUS_CMD_NULL || cmd == AWBUS_CMD_DATA_PUSH;
+}
+
+static int handle_control_candidate(uint8_t id, uint8_t expect_cmd,
+                                    const awbus_frame_t *rx,
+                                    awbus_frame_t *rx_out) {
+    mark_companion_seen(id);
+    if (rx->cmd == expect_cmd) {
+        if (rx_out) *rx_out = *rx;
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * Send `cmd` to `id` and wait for `expect_cmd`.
+ *
+ * This is intentionally stronger than the normal DATA_PUSH drain path. After
+ * sniff mode a companion can still have NULL wake frames or async DATA_PUSH
+ * staged, and occasionally the READY pin can be low even though an idle slave
+ * transaction is armed. A strict READY-gated wait can therefore time out even
+ * though the companion is alive; that is what produced post-sniff `riginfo`
+ * err -1 while a second `test-sniff` still worked.
+ *
+ * Robust behaviour:
+ *   1. send the control request;
+ *   2. drain READY frames looking for the expected reply;
+ *   3. occasionally clock a NULL transaction even if READY is low, to recover
+ *      from missed READY / stale idle descriptors;
+ *   4. if the original request may have landed while no slave transaction was
+ *      armed, resend the idempotent control request after CONTROL_RESEND_MS.
+ *
+ * This helper is used only for idempotent control commands: PING, STATUS_REQ,
+ * INFO_REQ. It must not be used for stateful ACTION commands.
  */
 static int ping_pong(uint8_t id, uint8_t cmd, uint8_t expect_cmd,
                      awbus_frame_t *rx_out) {
-    int rc = awbus_send(&g_bus, id, cmd, NULL, 0, NULL);
-    if (rc != AWBUS_OK) return rc;
-
+    awbus_frame_t rx = {0};
     uint32_t t0 = A->millis();
-    while (!g_bus.port->ready(g_bus.port->ctx, id))
-        if (A->millis() - t0 >= 50u) return AWBUS_ERR_TIMEOUT;
+    uint32_t last_req_ms = 0u;
+    uint32_t last_pump_ms = 0u;
+    int last_err = AWBUS_ERR_TIMEOUT;
 
-    awbus_frame_t local = {0};
-    awbus_frame_t *rx   = rx_out ? rx_out : &local;
-    rc = awbus_poll(&g_bus, id, rx);
-    return (rc == AWBUS_OK && rx->cmd == expect_cmd) ? AWBUS_OK : AWBUS_ERR_CRC;
+    while (A->millis() - t0 < CONTROL_REPLY_TIMEOUT_MS) {
+        uint32_t now = A->millis();
+        int do_request = 0;
+        int do_pump = 0;
+
+        if (last_req_ms == 0u || now - last_req_ms >= CONTROL_RESEND_MS) {
+            do_request = 1;
+        } else if (g_bus.port->ready(g_bus.port->ctx, id)) {
+            do_pump = 1;
+        } else if (now - last_pump_ms >= CONTROL_PUMP_MS) {
+            /* Low-rate unconditional pump. If the C6 really has no queued
+             * transaction this may deserialize as MAGIC, but it also kicks the
+             * ESP-IDF slave pipeline forward once it re-arms. */
+            do_pump = 1;
+        }
+
+        if (!do_request && !do_pump) {
+            A->delay_ms(1);
+            continue;
+        }
+
+        memset(&rx, 0, sizeof rx);
+        int rc;
+        if (do_request) {
+            rc = awbus_send(&g_bus, id, cmd, NULL, 0, &rx);
+            last_req_ms = now ? now : 1u;
+        } else {
+            rc = awbus_send(&g_bus, id, AWBUS_CMD_NULL, NULL, 0, &rx);
+            last_pump_ms = now;
+        }
+
+        if (rc == AWBUS_OK) {
+            if (handle_control_candidate(id, expect_cmd, &rx, rx_out))
+                return AWBUS_OK;
+
+            /* Valid AWBUS, wrong command. NULL/DATA_PUSH are normal stale
+             * async traffic. Any other command is also not fatal for presence;
+             * keep draining until the expected control reply appears. */
+            if (is_stale_async_cmd(rx.cmd))
+                A->delay_ms(1);
+            last_err = AWBUS_ERR_TIMEOUT;
+            continue;
+        }
+
+        /* MAGIC during an unconditional pump usually means the companion had
+         * not armed a transaction for that exact clock. Do not immediately
+         * mark the node dead; keep trying until the bounded timeout expires. */
+        if (rc != AWBUS_ERR_NODATA)
+            last_err = rc;
+        A->delay_ms(1);
+    }
+
+    return (last_err == AWBUS_OK) ? AWBUS_ERR_TIMEOUT : last_err;
 }
 
 static void probe_companions(void) {
+    uint32_t now_ms = A->millis();
     for (int i = 1; i <= AWBUS_COMPANION_COUNT; i++) {
-        int now = (ping_pong((uint8_t)i, AWBUS_CMD_PING, AWBUS_CMD_PONG, NULL) == AWBUS_OK);
-        if (now != (int)s_online[i])
-            kon_printf(&g_ks, "[bus] companion %d %s\r\n", i, now ? "online" : "offline");
-        s_online[i] = (uint8_t)now;
+        /* Any valid AWBUS frame proves the node is alive. During and just after
+         * sniffing the idle loop may see many NULL wake frames; avoid strict
+         * PING probes for recently-seen nodes. */
+        if (s_online[i] && s_last_seen_ms[i] != 0u &&
+            age_ms(now_ms, s_last_seen_ms[i]) < RECENT_SEEN_SKIP_MS) {
+            s_probe_fail[i] = 0u;
+            continue;
+        }
+
+        int ok = (ping_pong((uint8_t)i, AWBUS_CMD_PING, AWBUS_CMD_PONG, NULL) == AWBUS_OK);
+        uint8_t before_fail = s_probe_fail[i];
+        int was_online = s_online[i];
+        int changed = mark_companion_probe_result((uint8_t)i, ok);
+        if (changed > 0)
+            kon_printf(&g_ks, "[bus] companion %d online\r\n", i);
+        else if (changed < 0)
+            kon_printf(&g_ks, "[bus] companion %d offline: probe failed %u/%u\r\n",
+                       i, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
+        else if (!ok && was_online && s_probe_fail[i] != before_fail)
+            kon_printf(&g_ks, "[bus] companion %d suspect: probe failed %u/%u\r\n",
+                       i, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
     }
-    s_last_probe_ms = A->millis();
+    s_last_probe_ms = now_ms;
 }
 
 /* ---- konsole commands ---- */
@@ -142,8 +319,22 @@ static int cmd_bus(struct konsole *ks, int argc, char **argv) {
 
     if (strcmp(argv[1], "ping") == 0) {
         int rc = ping_pong(id, AWBUS_CMD_PING, AWBUS_CMD_PONG, NULL);
-        if (rc == AWBUS_OK) { kon_printf(ks, "PONG from comp-%d\r\n", id); s_online[id] = 1; }
-        else                { kon_printf(ks, "no response from comp-%d (err %d)\r\n", id, rc); s_online[id] = 0; }
+        if (rc == AWBUS_OK) {
+            kon_printf(ks, "PONG from comp-%d\r\n", id);
+            mark_companion_seen(id);
+        } else {
+            kon_printf(ks, "no response from comp-%d (err %d)\r\n", id, rc);
+            uint8_t before_fail = s_probe_fail[id];
+            int was_online = s_online[id];
+            int changed = mark_companion_probe_result(id, 0);
+            if (changed < 0) {
+                kon_printf(ks, "[bus] companion %u offline: manual ping failed %u/%u\r\n",
+                           (unsigned)id, (unsigned)s_probe_fail[id], (unsigned)PROBE_FAIL_LIMIT);
+            } else if (was_online && s_probe_fail[id] != before_fail) {
+                kon_printf(ks, "[bus] companion %u suspect: manual ping failed %u/%u\r\n",
+                           (unsigned)id, (unsigned)s_probe_fail[id], (unsigned)PROBE_FAIL_LIMIT);
+            }
+        }
         return rc == AWBUS_OK ? 0 : -1;
     }
 
@@ -192,8 +383,18 @@ static int cmd_riginfo(struct konsole *ks, int argc, char **argv) {
         awbus_frame_t rx = {0};
         int rc = ping_pong((uint8_t)i, AWBUS_CMD_INFO_REQ, AWBUS_CMD_INFO_RSP, &rx);
         if (rc != AWBUS_OK || rx.payload_len < 5) {
-            kon_printf(ks, "  %-4d  err %-3d\r\n", i, rc);
-            s_online[i] = 0;
+            kon_printf(ks, "  %-4d  err %-3d   fail=%u/%u\r\n", i, rc,
+                       (unsigned)(s_probe_fail[i] + 1u), (unsigned)PROBE_FAIL_LIMIT);
+            uint8_t before_fail = s_probe_fail[i];
+            int was_online = s_online[i];
+            int changed = mark_companion_probe_result((uint8_t)i, 0);
+            if (changed < 0) {
+                kon_printf(ks, "[bus] companion %d offline: riginfo failed %u/%u\r\n",
+                           i, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
+            } else if (was_online && s_probe_fail[i] != before_fail) {
+                kon_printf(ks, "[bus] companion %d suspect: riginfo failed %u/%u\r\n",
+                           i, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
+            }
             continue;
         }
         uint32_t up = (uint32_t)rx.payload[1]
@@ -206,6 +407,7 @@ static int cmd_riginfo(struct konsole *ks, int argc, char **argv) {
         if (rx.payload_len >= 29) memcpy(rev,   rx.payload + 21,  8);
         kon_printf(ks, "  %-4d  online   %-24s  %-7s  %u ms\r\n",
                    i, board, rev, (unsigned)up);
+        mark_companion_seen((uint8_t)i);
     }
     return 0;
 }
@@ -979,6 +1181,30 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
                    (unsigned)(total_blobs / elapsed_s));
     }
 
+    /* Post-sniff control-plane resync.
+     *
+     * The data plane has just proven the nodes are alive, but the companion SPI
+     * slave pipeline can still contain one stale NULL/DATA_PUSH wake frame. A
+     * following user command such as `riginfo` must not be the first thing to
+     * discover and clean that up. Verify STATUS here with the robust control
+     * helper; failures are reported as suspects, not immediate offline. */
+    uint32_t done_ms = A->millis();
+    s_last_probe_ms = done_ms;
+    s_probe_pause_until_ms = done_ms + POST_SNIFF_PROBE_GRACE_MS;
+    for (int ni = 0; ni < n_nodes; ni++) {
+        uint8_t nd = nodes[ni];
+        int rc = ping_pong(nd, AWBUS_CMD_STATUS_REQ, AWBUS_CMD_STATUS_RSP, NULL);
+        if (rc == AWBUS_OK) {
+            mark_companion_seen(nd);
+        } else {
+            int changed = mark_companion_probe_result(nd, 0);
+            kon_printf(ks, "[bus] companion %d suspect after sniff: control resync err %d fail=%u/%u\r\n",
+                       nd, rc, (unsigned)s_probe_fail[nd], (unsigned)PROBE_FAIL_LIMIT);
+            if (changed < 0)
+                kon_printf(ks, "[bus] companion %d offline: post-sniff control resync failed\r\n", nd);
+        }
+    }
+
     return 0;
 }
 
@@ -1033,7 +1259,9 @@ int brain_init(const arch_api_t *arch) {
 }
 
 void brain_run(void) {
-    if (A->millis() - s_last_probe_ms >= PROBE_INTERVAL_MS)
+    uint32_t now = A->millis();
+    if (time_reached(now, s_probe_pause_until_ms) &&
+        now - s_last_probe_ms >= PROBE_INTERVAL_MS)
         probe_companions();
 
     awbus_frame_t rx = {0};
@@ -1041,12 +1269,28 @@ void brain_run(void) {
         if (!s_online[i]) continue;
         int rc = awbus_poll(&g_bus, (uint8_t)i, &rx);
         if (rc == AWBUS_OK) {
-            kon_printf(&g_ks, "[bus] comp-%d  cmd=0x%02x  len=%d\r\n",
-                       i, rx.cmd, rx.payload_len);
+            mark_companion_seen((uint8_t)i);
+            /* NULL is a normal idle/wake frame after sniff drain. It proves the
+             * node is alive, but printing it every tick floods the UART and can
+             * itself become a bottleneck. */
+            if (rx.cmd != AWBUS_CMD_NULL) {
+                kon_printf(&g_ks, "[bus] comp-%d  cmd=0x%02x  len=%d\r\n",
+                           i, rx.cmd, rx.payload_len);
+            }
         } else if (rc != AWBUS_ERR_NODATA) {
-            /* Unexpected error from an online companion */
-            s_online[i] = 0;
-            kon_printf(&g_ks, "[bus] comp-%d offline (err %d)\r\n", i, rc);
+            /* Do not false-drop an otherwise good node on a single async poll
+             * error. Debounce it the same way as background probes, but keep
+             * the operator informed about suspect/offline transitions. */
+            uint8_t before_fail = s_probe_fail[i];
+            int was_online = s_online[i];
+            int changed = mark_companion_probe_result((uint8_t)i, 0);
+            if (changed < 0) {
+                kon_printf(&g_ks, "[bus] companion %d offline: async poll err %d fail=%u/%u\r\n",
+                           i, rc, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
+            } else if (was_online && s_probe_fail[i] != before_fail) {
+                kon_printf(&g_ks, "[bus] companion %d suspect: async poll err %d fail=%u/%u\r\n",
+                           i, rc, (unsigned)s_probe_fail[i], (unsigned)PROBE_FAIL_LIMIT);
+            }
         }
     }
 
