@@ -1,9 +1,11 @@
 #include <string.h>
+#include <inttypes.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "esp_wifi.h"
 #include "esp_timer.h"
 #include "esp_log.h"
+#include "esp_err.h"
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "aw_bus/aw_bus.h"
@@ -18,148 +20,256 @@
 #define BLOB_BUF_SIZE        AWBUS_MAX_PAYLOAD
 #define BLOB_FLUSH_THRESHOLD ((BLOB_BUF_SIZE * 3u) / 4u)
 
-/* Two buffers: s_fill is written by the WiFi callback; the other is
- * sent to the brain by wifi_sniff_flush once the buffers are swapped. */
 static uint8_t  s_blob[2][BLOB_BUF_SIZE];
-static uint16_t s_blob_used[2];     /* bytes used for frame records (after blob header) */
+static uint16_t s_blob_used[2];       /* bytes used for frame records after blob header */
 static uint8_t  s_blob_nframes[2];
+static uint32_t s_blob_first_seq[2];
 static volatile int s_fill = 0;
 static SemaphoreHandle_t s_mutex;
 
 /* ---- Capture state ---- */
-static volatile int s_running    = 0;
-static volatile int s_flush_due  = 0;
-static uint64_t     s_ts_offset  = 0;   /* brain_us − local_us at timesync */
+static volatile int s_running     = 0;
+static volatile int s_flush_due   = 0;
+static int64_t      s_ts_offset   = 0;   /* brain_us - local_us at last timesync */
 static uint8_t      s_filter_mask = 0;
 static volatile uint8_t s_cur_channel = 1;
+static volatile int s_last_err = 0;
 
 /* ---- Channel hopper ---- */
-static uint8_t           s_channels[13];
-static uint8_t           s_n_channels  = 0;
-static volatile uint8_t  s_ch_idx      = 0;
+static uint8_t            s_channels[13];
+static uint8_t            s_n_channels = 0;
+static volatile uint8_t   s_ch_idx     = 0;
 static esp_timer_handle_t s_hop_timer  = NULL;
+static esp_timer_handle_t s_flush_timer = NULL;
 
-/* ---- Statistics ---- */
-static volatile uint32_t s_captured  = 0;
+/* ---- Core counters ---- */
+static volatile uint32_t s_captured  = 0;  /* actually queued into blob buffer */
 static volatile uint32_t s_dropped   = 0;
-static volatile uint32_t s_sent      = 0;
+static volatile uint32_t s_sent      = 0;  /* handed to AWBUS push */
 static volatile uint32_t s_hop_count = 0;
+static volatile uint32_t s_frame_seq = 0;  /* increments for every accepted frame */
+static volatile uint32_t s_blob_seq  = 0;
 
-/* ---- Pending blob (set by wifi_sniff_flush, cleared by wifi_sniff_pop_pending) ----
- * wifi_sniff_flush signals the brain by raising READY but does NOT push the blob
- * into the SPI queue yet — the IDLE slot already sitting at the front of the queue
- * would be consumed first, sending a NULL frame to the brain and leaving the REPLY
- * stuck.  Instead, the flush raises READY and parks the swapped buffer here.
- * When the brain sends its NULL poll, companion_run -> handle_brain_frame(NULL) ->
- * wifi_sniff_pop_pending queues the REPLY as the response to that NULL, which is
- * the correct position in the queue. */
-static volatile int s_blob_pending      = 0;
-static int          s_pending_idx       = 0;
-static uint16_t     s_pending_used      = 0;
-static uint8_t      s_pending_nframes   = 0;
+/* ---- Capture/filter counters ---- */
+static volatile uint32_t s_seen_mgmt = 0;
+static volatile uint32_t s_seen_data = 0;
+static volatile uint32_t s_seen_ctrl = 0;
+static volatile uint32_t s_seen_misc = 0;
+static volatile uint32_t s_seen_short = 0;
+static volatile uint32_t s_filtered = 0;
+static volatile uint32_t s_kept_beacon = 0;
+static volatile uint32_t s_kept_probe_req = 0;
+static volatile uint32_t s_kept_probe_rsp = 0;
+static volatile uint32_t s_kept_eapol = 0;
 
-/* ---- Timer callbacks ---- */
+/* ---- Drop/pathology counters ---- */
+static volatile uint32_t s_drop_mutex_busy = 0;
+static volatile uint32_t s_drop_blob_full = 0;
+static volatile uint32_t s_drop_record_limit = 0;
+static volatile uint32_t s_drop_pending_busy = 0;
+static volatile uint32_t s_drop_push_fail = 0;
+
+/* ---- Blob/drain counters ---- */
+static volatile uint32_t s_blob_flushes = 0;
+static volatile uint32_t s_blob_popped = 0;
+static volatile uint32_t s_blob_pending_seen = 0;
+static volatile uint32_t s_channel_set_ok = 0;
+static volatile uint32_t s_channel_set_err = 0;
+static volatile uint32_t s_max_blob_bytes = 0;
+static volatile uint32_t s_max_blob_frames = 0;
+static volatile uint32_t s_max_fill_bytes = 0;
+static volatile uint32_t s_max_fill_frames = 0;
+static volatile uint32_t s_flush_timer_fires = 0;
+static volatile uint32_t s_flush_full_fires = 0;
+static volatile uint32_t s_flush_empty = 0;
+
+/* ---- Pending blob staged for the next NULL poll ---- */
+static volatile int s_blob_pending = 0;
+static int          s_pending_idx = 0;
+static uint16_t     s_pending_used = 0;
+static uint8_t      s_pending_nframes = 0;
+
+static inline void wr16(uint8_t *p, uint16_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)(v >> 8u);
+}
+
+static inline void wr32(uint8_t *p, uint32_t v) {
+    p[0] = (uint8_t)(v & 0xFFu);
+    p[1] = (uint8_t)((v >> 8u) & 0xFFu);
+    p[2] = (uint8_t)((v >> 16u) & 0xFFu);
+    p[3] = (uint8_t)((v >> 24u) & 0xFFu);
+}
+
+static inline void wr64(uint8_t *p, uint64_t v) {
+    for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (i * 8));
+}
+
+static inline void bump_drop(volatile uint32_t *why) {
+    (*why)++;
+    s_dropped++;
+}
+
+static void reset_stats(void) {
+    s_captured = s_dropped = s_sent = s_hop_count = 0;
+    s_frame_seq = s_blob_seq = 0;
+    s_seen_mgmt = s_seen_data = s_seen_ctrl = s_seen_misc = s_seen_short = 0;
+    s_filtered = 0;
+    s_kept_beacon = s_kept_probe_req = s_kept_probe_rsp = s_kept_eapol = 0;
+    s_drop_mutex_busy = s_drop_blob_full = s_drop_record_limit = 0;
+    s_drop_pending_busy = s_drop_push_fail = 0;
+    s_blob_flushes = s_blob_popped = s_blob_pending_seen = 0;
+    s_channel_set_ok = s_channel_set_err = 0;
+    s_max_blob_bytes = s_max_blob_frames = s_max_fill_bytes = s_max_fill_frames = 0;
+    s_flush_timer_fires = s_flush_full_fires = s_flush_empty = 0;
+    s_last_err = 0;
+}
 
 static void flush_timer_cb(void *arg) {
     (void)arg;
     s_flush_due = 1;
+    s_flush_timer_fires++;
+}
+
+static int set_channel_counted(uint8_t ch) {
+    esp_err_t err = esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE);
+    if (err == ESP_OK) {
+        s_cur_channel = ch;
+        s_channel_set_ok++;
+        s_last_err = 0;
+        return 1;
+    }
+    s_channel_set_err++;
+    s_last_err = (int)err;
+    return 0;
 }
 
 static void hop_timer_cb(void *arg) {
     (void)arg;
     if (!s_running || s_n_channels == 0) return;
     s_ch_idx = (uint8_t)((s_ch_idx + 1u) % s_n_channels);
-    s_cur_channel = s_channels[s_ch_idx];
-    esp_wifi_set_channel(s_cur_channel, WIFI_SECOND_CHAN_NONE);
+    set_channel_counted(s_channels[s_ch_idx]);
     s_hop_count++;
 }
 
-/* ---- Flush timer (created once, stopped/started per sniff session) ---- */
-static esp_timer_handle_t s_flush_timer = NULL;
-
-/* ---- WiFi promiscuous callback ---- */
+static int is_eapol_data(const uint8_t *frame, uint16_t frame_len, uint8_t fsubtype) {
+    if (frame_len < 32u) return 0;
+    uint8_t  fc1      = frame[1];
+    uint16_t body_off = (fsubtype & 0x08u) ? 26u : 24u;
+    if ((fc1 & 0x03u) == 0x03u) body_off += 6u;
+    if (frame_len < (uint16_t)(body_off + 8u)) return 0;
+    const uint8_t *llc = frame + body_off;
+    return (llc[0] == 0xAAu && llc[1] == 0xAAu && llc[2] == 0x03u &&
+            llc[3] == 0x00u && llc[4] == 0x00u && llc[5] == 0x00u &&
+            llc[6] == 0x88u && llc[7] == 0x8Eu);
+}
 
 static void wifi_rx_cb(void *buf, wifi_promiscuous_pkt_type_t pkt_type) {
-    if (!s_running || pkt_type == WIFI_PKT_MISC) return;
+    if (!s_running) return;
+
+    if (pkt_type == WIFI_PKT_MISC) {
+        s_seen_misc++;
+        return;
+    }
 
     const wifi_promiscuous_pkt_t *pkt = (const wifi_promiscuous_pkt_t *)buf;
     const uint8_t *frame = pkt->payload;
-    uint16_t frame_len   = (uint16_t)pkt->rx_ctrl.sig_len;
+    uint16_t orig_len = (uint16_t)pkt->rx_ctrl.sig_len;
 
-    /* Strip 4-byte FCS appended by ESP-IDF */
+    /* ESP-IDF commonly includes FCS in sig_len; strip it when present. */
+    uint16_t frame_len = orig_len;
     if (frame_len > 4u) frame_len -= 4u;
-    if (frame_len < 4u) return;
+    if (frame_len < 4u) {
+        s_seen_short++;
+        return;
+    }
 
     uint8_t fc0      = frame[0];
     uint8_t ftype    = (fc0 >> 2u) & 0x03u;
     uint8_t fsubtype = (fc0 >> 4u) & 0x0Fu;
 
+    if (pkt_type == WIFI_PKT_MGMT) s_seen_mgmt++;
+    else if (pkt_type == WIFI_PKT_DATA) s_seen_data++;
+    else if (pkt_type == WIFI_PKT_CTRL) s_seen_ctrl++;
+    else s_seen_misc++;
+
     int accept = 0;
-    if (pkt_type == WIFI_PKT_MGMT) {
-        if ((s_filter_mask & WIFI_FILTER_BEACON)    && ftype == 0 && fsubtype == 8)  accept = 1;
-        if ((s_filter_mask & WIFI_FILTER_PROBE_REQ) && ftype == 0 && fsubtype == 4)  accept = 1;
-        if ((s_filter_mask & WIFI_FILTER_PROBE_RSP) && ftype == 0 && fsubtype == 5)  accept = 1;
+    uint8_t rec_flags = 0;
+    if (pkt_type == WIFI_PKT_MGMT && ftype == 0) {
+        if ((s_filter_mask & WIFI_FILTER_BEACON) && fsubtype == 8) {
+            accept = 1; s_kept_beacon++;
+        } else if ((s_filter_mask & WIFI_FILTER_PROBE_REQ) && fsubtype == 4) {
+            accept = 1; s_kept_probe_req++;
+        } else if ((s_filter_mask & WIFI_FILTER_PROBE_RSP) && fsubtype == 5) {
+            accept = 1; s_kept_probe_rsp++;
+        }
     } else if (pkt_type == WIFI_PKT_DATA && (s_filter_mask & WIFI_FILTER_EAPOL)) {
-        /* Body offset: 24 for non-QoS, 26 for QoS (subtype bit 3 set).
-         * Add 6 for 4-address frames (ToDS=1 && FromDS=1). */
-        uint8_t  fc1      = frame[1];
-        uint16_t body_off = (fsubtype & 0x08u) ? 26u : 24u;
-        if ((fc1 & 0x03u) == 0x03u) body_off += 6u;
-        /* LLC+SNAP EAPOL magic: AA AA 03 00 00 00 88 8E */
-        if (frame_len >= body_off + 8u) {
-            const uint8_t *llc = frame + body_off;
-            if (llc[0] == 0xAAu && llc[1] == 0xAAu && llc[2] == 0x03u &&
-                llc[3] == 0x00u && llc[4] == 0x00u && llc[5] == 0x00u &&
-                llc[6] == 0x88u && llc[7] == 0x8Eu)
-                accept = 1;
+        if (is_eapol_data(frame, frame_len, fsubtype)) {
+            accept = 1;
+            rec_flags |= WIFI_REC_F_EAPOL;
+            s_kept_eapol++;
         }
     }
 
-    if (!accept) return;
+    if (!accept) {
+        s_filtered++;
+        return;
+    }
 
-    /* Cap frame size — prevents oversized records from wasting blob space */
-    if (frame_len > 400u) frame_len = 400u;
+    uint32_t frame_seq = ++s_frame_seq;
+    uint16_t captured_len = frame_len;
+    if (captured_len > (uint16_t)WIFI_SNIFF_SNAPLEN) {
+        captured_len = (uint16_t)WIFI_SNIFF_SNAPLEN;
+        rec_flags |= WIFI_REC_F_TRUNCATED;
+    }
 
-    uint64_t ts_us  = (uint64_t)esp_timer_get_time() + s_ts_offset;
-    int8_t   rssi   = (int8_t)pkt->rx_ctrl.rssi;
-    uint8_t  ch     = (uint8_t)pkt->rx_ctrl.channel;
-    uint16_t needed = WIFI_RECORD_HDR_SIZE + frame_len;
+    uint64_t ts_us = (uint64_t)((int64_t)esp_timer_get_time() + s_ts_offset);
+    int8_t   rssi  = (int8_t)pkt->rx_ctrl.rssi;
+    uint8_t  ch    = (uint8_t)pkt->rx_ctrl.channel;
+    uint16_t needed = (uint16_t)(WIFI_RECORD_HDR_SIZE + captured_len);
 
-    /* Non-blocking mutex: if flush is in progress, drop the frame */
-    if (xSemaphoreTake(s_mutex, 0) == pdTRUE) {
-        int fi = s_fill;
-        if (s_blob_nframes[fi] < 255u &&
-            WIFI_BLOB_HDR_SIZE + s_blob_used[fi] + needed <= BLOB_BUF_SIZE) {
+    if (xSemaphoreTake(s_mutex, 0) != pdTRUE) {
+        bump_drop(&s_drop_mutex_busy);
+        return;
+    }
 
-            uint8_t *p = s_blob[fi] + WIFI_BLOB_HDR_SIZE + s_blob_used[fi];
-
-            /* ts_us — 8 bytes LE */
-            for (int i = 0; i < 8; i++) p[i] = (uint8_t)(ts_us >> (i * 8));
-            /* frame_len — 2 bytes LE */
-            p[8]  = (uint8_t)(frame_len & 0xFFu);
-            p[9]  = (uint8_t)(frame_len >> 8u);
-            /* channel, rssi */
-            p[10] = ch;
-            p[11] = (uint8_t)rssi;
-            /* 802.11 frame bytes */
-            memcpy(p + WIFI_RECORD_HDR_SIZE, frame, frame_len);
-
-            s_blob_used[fi]   += needed;
-            s_blob_nframes[fi]++;
-            s_captured++;
-        } else {
-            s_dropped++;
-        }
+    int fi = s_fill;
+    if (s_blob_nframes[fi] >= 255u) {
         xSemaphoreGive(s_mutex);
-    } else {
-        s_dropped++;
+        bump_drop(&s_drop_record_limit);
+        return;
     }
+    if (WIFI_BLOB_HDR_SIZE + s_blob_used[fi] + needed > BLOB_BUF_SIZE) {
+        xSemaphoreGive(s_mutex);
+        bump_drop(&s_drop_blob_full);
+        return;
+    }
+
+    if (s_blob_nframes[fi] == 0u)
+        s_blob_first_seq[fi] = frame_seq;
+
+    uint8_t *p = s_blob[fi] + WIFI_BLOB_HDR_SIZE + s_blob_used[fi];
+    wr64(p + 0, ts_us);
+    wr32(p + 8, frame_seq);
+    wr16(p + 12, captured_len);
+    wr16(p + 14, frame_len);
+    p[16] = ch;
+    p[17] = (uint8_t)rssi;
+    p[18] = fc0;
+    p[19] = rec_flags;
+    memcpy(p + WIFI_RECORD_HDR_SIZE, frame, captured_len);
+
+    s_blob_used[fi] = (uint16_t)(s_blob_used[fi] + needed);
+    s_blob_nframes[fi]++;
+    s_captured++;
+
+    if ((uint32_t)s_blob_used[fi] > s_max_fill_bytes) s_max_fill_bytes = s_blob_used[fi];
+    if ((uint32_t)s_blob_nframes[fi] > s_max_fill_frames) s_max_fill_frames = s_blob_nframes[fi];
+
+    xSemaphoreGive(s_mutex);
 }
 
-/* ---- Public API ---- */
-
 void wifi_sniff_init(void) {
-    /* NVS is required by esp_wifi_init */
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -174,43 +284,44 @@ void wifi_sniff_init(void) {
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
-    /* STA mode (without connecting) is required for esp_wifi_set_channel to
-     * actually tune the radio.  WIFI_MODE_NULL leaves the receiver inactive. */
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     s_mutex = xSemaphoreCreateMutex();
     configASSERT(s_mutex);
 
-    /* Create timers once; they are started/stopped per session */
     const esp_timer_create_args_t flush_args = { .callback = flush_timer_cb, .name = "sniff-flush" };
     ESP_ERROR_CHECK(esp_timer_create(&flush_args, &s_flush_timer));
 
     const esp_timer_create_args_t hop_args = { .callback = hop_timer_cb, .name = "sniff-hop" };
     ESP_ERROR_CHECK(esp_timer_create(&hop_args, &s_hop_timer));
 
-    ESP_LOGI(TAG, "WiFi sniff ready");
+    ESP_LOGI(TAG, "WiFi sniff ready: awbus_payload=%u snaplen=%u",
+             (unsigned)AWBUS_MAX_PAYLOAD, (unsigned)WIFI_SNIFF_SNAPLEN);
 }
 
 void wifi_sniff_timesync(uint64_t brain_us) {
-    s_ts_offset = brain_us - (uint64_t)esp_timer_get_time();
+    s_ts_offset = (int64_t)brain_us - (int64_t)esp_timer_get_time();
     ESP_LOGI(TAG, "timesync offset=%" PRId64 " us", (int64_t)s_ts_offset);
 }
 
 void wifi_sniff_start(const uint8_t *channels, uint8_t n_ch,
                       uint8_t filter_mask, uint16_t hop_period_ms) {
-    /* Reset double-buffer */
+    if (s_running) wifi_sniff_stop();
+
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_fill = 0;
-    memset(s_blob_used,    0, sizeof s_blob_used);
+    memset(s_blob_used, 0, sizeof s_blob_used);
     memset(s_blob_nframes, 0, sizeof s_blob_nframes);
+    memset(s_blob_first_seq, 0, sizeof s_blob_first_seq);
     xSemaphoreGive(s_mutex);
 
-    s_captured    = 0;
-    s_dropped     = 0;
-    s_sent        = 0;
-    s_hop_count   = 0;
-    s_flush_due   = 0;
+    s_blob_pending = 0;
+    s_pending_idx = 0;
+    s_pending_used = 0;
+    s_pending_nframes = 0;
+    s_flush_due = 0;
+    reset_stats();
     s_filter_mask = filter_mask;
 
     if (n_ch > 13u) n_ch = 13u;
@@ -219,27 +330,25 @@ void wifi_sniff_start(const uint8_t *channels, uint8_t n_ch,
     s_ch_idx      = 0;
     s_cur_channel = (n_ch > 0u) ? channels[0] : 1u;
 
-    /* Configure ESP-IDF promiscuous filter */
     wifi_promiscuous_filter_t flt = {0};
     if (filter_mask & (WIFI_FILTER_BEACON | WIFI_FILTER_PROBE_REQ | WIFI_FILTER_PROBE_RSP))
         flt.filter_mask |= WIFI_PROMIS_FILTER_MASK_MGMT;
     if (filter_mask & WIFI_FILTER_EAPOL)
         flt.filter_mask |= WIFI_PROMIS_FILTER_MASK_DATA;
 
+    esp_wifi_set_promiscuous(false);
     esp_wifi_set_promiscuous_filter(&flt);
     esp_wifi_set_promiscuous_rx_cb(wifi_rx_cb);
-    esp_wifi_set_channel(s_cur_channel, WIFI_SECOND_CHAN_NONE);
+    set_channel_counted(s_cur_channel);
     esp_wifi_set_promiscuous(true);
 
     s_running = 1;
-
     esp_timer_start_periodic(s_flush_timer, 50000u);   /* 50 ms */
-
     if (n_ch > 1u && hop_period_ms > 0u)
         esp_timer_start_periodic(s_hop_timer, (uint64_t)hop_period_ms * 1000u);
 
-    ESP_LOGI(TAG, "sniff start: filter=0x%02x  ch=%d  hop=%dms",
-             filter_mask, n_ch, hop_period_ms);
+    ESP_LOGI(TAG, "sniff start: filter=0x%02x ch_count=%u hop=%ums",
+             filter_mask, (unsigned)n_ch, (unsigned)hop_period_ms);
 }
 
 void wifi_sniff_stop(void) {
@@ -248,19 +357,21 @@ void wifi_sniff_stop(void) {
 
     esp_timer_stop(s_flush_timer);
     esp_timer_stop(s_hop_timer);
-
     esp_wifi_set_promiscuous(false);
-    s_flush_due = 1;   /* flush whatever is in the fill buffer */
+    s_flush_due = 1;   /* ask loop to seal remaining buffered frames */
 
-    ESP_LOGI(TAG, "sniff stop: captured=%u dropped=%u sent=%u",
-             (unsigned)s_captured, (unsigned)s_dropped, (unsigned)s_sent);
+    ESP_LOGI(TAG, "sniff stop: captured=%u dropped=%u sent=%u blob_seq=%u frame_seq=%u",
+             (unsigned)s_captured, (unsigned)s_dropped, (unsigned)s_sent,
+             (unsigned)s_blob_seq, (unsigned)s_frame_seq);
 }
 
 int wifi_sniff_flush(awbus_t *bus) {
-    /* Don't overwrite a blob that hasn't been sent yet */
-    if (s_blob_pending) return 0;
+    if (s_blob_pending) {
+        s_blob_pending_seen++;
+        if (s_flush_due) s_drop_pending_busy++;
+        return 0;
+    }
 
-    /* Gate: only flush when the timer fired or the buffer is nearly full */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     int      fi       = s_fill;
     uint8_t  nf       = s_blob_nframes[fi];
@@ -268,79 +379,132 @@ int wifi_sniff_flush(awbus_t *bus) {
     int      buf_full = (WIFI_BLOB_HDR_SIZE + used >= BLOB_FLUSH_THRESHOLD);
     xSemaphoreGive(s_mutex);
 
-    if (nf == 0u) { s_flush_due = 0; return 0; }
+    if (buf_full) s_flush_full_fires++;
+    if (nf == 0u) {
+        if (s_flush_due) s_flush_empty++;
+        s_flush_due = 0;
+        return 0;
+    }
     if (!s_flush_due && !buf_full) return 0;
     s_flush_due = 0;
 
-    /* Swap buffers under lock — WiFi cb switches to writing the other buffer */
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     fi   = s_fill;
     nf   = s_blob_nframes[fi];
     used = s_blob_used[fi];
+    if (nf == 0u) {
+        xSemaphoreGive(s_mutex);
+        s_flush_empty++;
+        return 0;
+    }
 
-    if (nf == 0u) { xSemaphoreGive(s_mutex); return 0; }
+    uint32_t bseq = ++s_blob_seq;
+    uint32_t first_seq = s_blob_first_seq[fi];
 
-    /* Write blob header into the flush buffer before swapping */
     s_blob[fi][0] = WIFI_DATA_SNIFF_BLOB;
-    s_blob[fi][1] = (uint8_t)AWBUS_NODE_ID;
-    s_blob[fi][2] = nf;
-    s_blob[fi][3] = s_cur_channel;
+    s_blob[fi][1] = WIFI_PROTO_VERSION;
+    s_blob[fi][2] = (uint8_t)AWBUS_NODE_ID;
+    s_blob[fi][3] = nf;
+    s_blob[fi][4] = s_cur_channel;
+    s_blob[fi][5] = 0;
+    s_blob[fi][6] = WIFI_BLOB_HDR_SIZE;
+    s_blob[fi][7] = 0;
+    wr32(s_blob[fi] + 8, bseq);
+    wr32(s_blob[fi] + 12, first_seq);
+    wr16(s_blob[fi] + 16, used);
+    wr16(s_blob[fi] + 18, s_blob_used[fi ^ 1]);
+    wr32(s_blob[fi] + 20, s_dropped);
 
     int flush_idx = fi;
     int next_idx  = fi ^ 1;
-    s_blob_used[next_idx]    = 0;
+    s_blob_used[next_idx] = 0;
     s_blob_nframes[next_idx] = 0;
+    s_blob_first_seq[next_idx] = 0;
     s_fill = next_idx;
     xSemaphoreGive(s_mutex);
 
-    /* Park the ready blob and raise READY.  The actual awbus_companion_push
-     * happens in wifi_sniff_pop_pending when the brain's next NULL poll arrives,
-     * so the REPLY slot is at the correct position in the SPI queue. */
-    s_pending_idx     = flush_idx;
-    s_pending_used    = used;
+    s_pending_idx = flush_idx;
+    s_pending_used = used;
     s_pending_nframes = nf;
-    s_blob_pending    = 1;
+    s_blob_pending = 1;
+
+    s_blob_flushes++;
+    if ((uint32_t)(WIFI_BLOB_HDR_SIZE + used) > s_max_blob_bytes)
+        s_max_blob_bytes = (uint32_t)(WIFI_BLOB_HDR_SIZE + used);
+    if ((uint32_t)nf > s_max_blob_frames)
+        s_max_blob_frames = nf;
+
     awbus_companion_set_ready(bus, 1);
     return 1;
 }
 
-/* Called from handle_brain_frame(AWBUS_CMD_NULL) — sends the pending blob as the
- * reply to the brain's NULL poll.  Returns 1 if a reply was queued, 0 otherwise. */
 int wifi_sniff_pop_pending(awbus_t *bus) {
     if (!s_blob_pending) return 0;
     s_blob_pending = 0;
 
-    uint16_t total = WIFI_BLOB_HDR_SIZE + s_pending_used;
+    uint16_t total = (uint16_t)(WIFI_BLOB_HDR_SIZE + s_pending_used);
     int rc = awbus_companion_push(bus, AWBUS_CMD_DATA_PUSH,
                                   s_blob[s_pending_idx], total, NULL);
     if (rc != AWBUS_OK) {
+        s_last_err = rc;
+        s_drop_push_fail++;
         s_dropped += s_pending_nframes;
         return 0;
     }
     awbus_companion_set_ready(bus, 1);
     s_sent += s_pending_nframes;
+    s_blob_popped++;
     return 1;
 }
 
-uint16_t wifi_sniff_telemetry(uint8_t *buf) {
-    buf[0] = WIFI_DATA_TELEMETRY;
-    buf[1] = (uint8_t)AWBUS_NODE_ID;
-    buf[2] = s_cur_channel;
-    buf[3] = 0;
+static void put_u32_counter(uint8_t *buf, unsigned idx, uint32_t val) {
+    uint8_t *p = buf + WIFI_TELEM_HDR_SIZE + (idx * 4u);
+    wr32(p, val);
+}
 
-    int off = 4;
-    uint32_t vals[5] = {
-        s_captured,
-        s_dropped,
-        s_sent,
-        s_hop_count,
-        (uint32_t)((uint64_t)esp_timer_get_time() / 1000u),
-    };
-    for (int i = 0; i < 5; i++) {
-        buf[off++] = (uint8_t)( vals[i]        & 0xFFu);
-        buf[off++] = (uint8_t)((vals[i] >>  8) & 0xFFu);
-        buf[off++] = (uint8_t)((vals[i] >> 16) & 0xFFu);
-        buf[off++] = (uint8_t)((vals[i] >> 24) & 0xFFu);
-    }
-    return (uint16_t)off;   /* == WIFI_TELEMETRY_SIZE == 24 */
+uint16_t wifi_sniff_telemetry(uint8_t *buf) {
+    memset(buf, 0, WIFI_TELEMETRY_SIZE);
+    buf[0] = WIFI_DATA_TELEMETRY;
+    buf[1] = WIFI_PROTO_VERSION;
+    buf[2] = (uint8_t)AWBUS_NODE_ID;
+    buf[3] = s_cur_channel;
+    buf[4] = (uint8_t)(s_running ? 1u : 0u);
+    buf[5] = (uint8_t)(s_blob_pending ? 1u : 0u);
+    buf[6] = (uint8_t)s_fill;
+    buf[7] = (uint8_t)(s_last_err & 0xFF);
+
+    put_u32_counter(buf, WIFI_TELEM_U32_LOCAL_MS, (uint32_t)((uint64_t)esp_timer_get_time() / 1000u));
+    put_u32_counter(buf, WIFI_TELEM_U32_CAPTURED, s_captured);
+    put_u32_counter(buf, WIFI_TELEM_U32_SENT, s_sent);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_TOTAL, s_dropped);
+    put_u32_counter(buf, WIFI_TELEM_U32_SEEN_MGMT, s_seen_mgmt);
+    put_u32_counter(buf, WIFI_TELEM_U32_SEEN_DATA, s_seen_data);
+    put_u32_counter(buf, WIFI_TELEM_U32_SEEN_CTRL, s_seen_ctrl);
+    put_u32_counter(buf, WIFI_TELEM_U32_SEEN_MISC, s_seen_misc);
+    put_u32_counter(buf, WIFI_TELEM_U32_SEEN_SHORT, s_seen_short);
+    put_u32_counter(buf, WIFI_TELEM_U32_FILTERED, s_filtered);
+    put_u32_counter(buf, WIFI_TELEM_U32_KEPT_BEACON, s_kept_beacon);
+    put_u32_counter(buf, WIFI_TELEM_U32_KEPT_PROBE_REQ, s_kept_probe_req);
+    put_u32_counter(buf, WIFI_TELEM_U32_KEPT_PROBE_RSP, s_kept_probe_rsp);
+    put_u32_counter(buf, WIFI_TELEM_U32_KEPT_EAPOL, s_kept_eapol);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_MUTEX_BUSY, s_drop_mutex_busy);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_BLOB_FULL, s_drop_blob_full);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_RECORD_LIMIT, s_drop_record_limit);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_PENDING_BUSY, s_drop_pending_busy);
+    put_u32_counter(buf, WIFI_TELEM_U32_DROP_PUSH_FAIL, s_drop_push_fail);
+    put_u32_counter(buf, WIFI_TELEM_U32_BLOB_FLUSHES, s_blob_flushes);
+    put_u32_counter(buf, WIFI_TELEM_U32_BLOB_POPPED, s_blob_popped);
+    put_u32_counter(buf, WIFI_TELEM_U32_BLOB_PENDING_SEEN, s_blob_pending_seen);
+    put_u32_counter(buf, WIFI_TELEM_U32_HOP_COUNT, s_hop_count);
+    put_u32_counter(buf, WIFI_TELEM_U32_CHANNEL_SET_OK, s_channel_set_ok);
+    put_u32_counter(buf, WIFI_TELEM_U32_CHANNEL_SET_ERR, s_channel_set_err);
+    put_u32_counter(buf, WIFI_TELEM_U32_MAX_BLOB_BYTES, s_max_blob_bytes);
+    put_u32_counter(buf, WIFI_TELEM_U32_MAX_BLOB_FRAMES, s_max_blob_frames);
+    put_u32_counter(buf, WIFI_TELEM_U32_MAX_FILL_BYTES, s_max_fill_bytes);
+    put_u32_counter(buf, WIFI_TELEM_U32_MAX_FILL_FRAMES, s_max_fill_frames);
+    put_u32_counter(buf, WIFI_TELEM_U32_FLUSH_TIMER_FIRES, s_flush_timer_fires);
+    put_u32_counter(buf, WIFI_TELEM_U32_FLUSH_FULL_FIRES, s_flush_full_fires);
+    put_u32_counter(buf, WIFI_TELEM_U32_FLUSH_EMPTY, s_flush_empty);
+
+    return WIFI_TELEMETRY_SIZE;
 }

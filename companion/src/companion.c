@@ -198,6 +198,16 @@ static int handle_brain_frame(const awbus_frame_t *rx) {
             return 0;
         }
 
+        case WIFI_ACTION_TELEMETRY_REQ: {
+            uint8_t tbuf[WIFI_TELEMETRY_SIZE];
+            uint16_t tlen = wifi_sniff_telemetry(tbuf);
+            if (awbus_companion_push(&g_bus, AWBUS_CMD_DATA_PUSH, tbuf, tlen, NULL) == AWBUS_OK) {
+                awbus_companion_set_ready(&g_bus, 1);
+                return 1;
+            }
+            return 0;
+        }
+
         default:
             ESP_LOGW(TAG, "unknown ACTION subtype 0x%02x", rx->payload[0]);
             return 0;

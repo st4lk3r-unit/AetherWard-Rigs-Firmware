@@ -334,6 +334,21 @@ static int cmd_bench(struct konsole *ks, int argc, char **argv) {
 
 /* ---- test-sniff helpers ---- */
 
+static uint16_t rd16le(const uint8_t *p) {
+    return (uint16_t)p[0] | ((uint16_t)p[1] << 8u);
+}
+static uint32_t rd32le(const uint8_t *p) {
+    return (uint32_t)p[0]
+         | ((uint32_t)p[1] << 8u)
+         | ((uint32_t)p[2] << 16u)
+         | ((uint32_t)p[3] << 24u);
+}
+static uint64_t rd64le(const uint8_t *p) {
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= (uint64_t)p[i] << (i * 8);
+    return v;
+}
+
 /* One line of a hex dump: offset, 16 hex bytes (8+8), ASCII sidebar. */
 static void hexdump_line(struct konsole *ks, uint16_t off,
                          const uint8_t *b, int n) {
@@ -395,39 +410,29 @@ static void print_mac(struct konsole *ks, const uint8_t *m) {
                m[0], m[1], m[2], m[3], m[4], m[5]);
 }
 
-/* Print full decoded info + hex dump for one 802.11 frame. */
-static void verbose_frame(struct konsole *ks, uint64_t ts_us, uint8_t ch,
-                           int8_t rssi, const uint8_t *fr, uint16_t flen) {
+static void verbose_frame(struct konsole *ks, uint32_t seq, uint64_t ts_us, uint8_t ch,
+                          int8_t rssi, uint8_t fc0, uint8_t rec_flags,
+                          const uint8_t *fr, uint16_t flen, uint16_t orig_len) {
     if (flen < 2) return;
 
-    uint8_t fc0     = fr[0];
     uint8_t fc1     = fr[1];
     uint8_t ftype   = (fc0 >> 2) & 0x03u;
     uint8_t fsub    = (fc0 >> 4) & 0x0Fu;
-
-    /* Detect EAPOL inside data frames */
-    int is_eapol = 0;
-    if (ftype == 2 && flen >= 32u) {
-        uint16_t body = (fsub & 0x08u) ? 26u : 24u;
-        if ((fc1 & 0x03u) == 0x03u) body += 6u;
-        if (flen >= (uint16_t)(body + 8u)) {
-            const uint8_t *llc = fr + body;
-            is_eapol = (llc[0] == 0xAAu && llc[1] == 0xAAu && llc[2] == 0x03u &&
-                        llc[6] == 0x88u && llc[7] == 0x8Eu);
-        }
-    }
+    int is_eapol    = (rec_flags & WIFI_REC_F_EAPOL) != 0;
+    int truncated   = (rec_flags & WIFI_REC_F_TRUNCATED) != 0;
 
     uint32_t ts_ms  = (uint32_t)(ts_us / 1000u);
     uint32_t ts_s   = ts_ms / 1000u;
     uint32_t ts_fms = ts_ms % 1000u;
 
-    kon_printf(ks, "  [%u.%03u] ch%-2u rssi=%-4d len=%-4u  %s",
+    kon_printf(ks, "  [%u.%03u] seq=%u ch%-2u rssi=%-4d len=%u/%u  %s%s",
                (unsigned)ts_s, (unsigned)ts_fms,
-               (unsigned)ch, (int)rssi, (unsigned)flen,
-               is_eapol ? "EAPOL" : frame_type_str(fc0));
+               (unsigned)seq, (unsigned)ch, (int)rssi,
+               (unsigned)flen, (unsigned)orig_len,
+               is_eapol ? "EAPOL" : frame_type_str(fc0),
+               truncated ? " TRUNC" : "");
 
     if (ftype == 0 && flen >= 24u) {
-        /* Management: DA=addr1 SA=addr2 BSSID=addr3 */
         uint16_t ie_off = (fsub == 8 || fsub == 5) ? 36u : 24u;
         char ssid[33] = {0};
         int ssid_len = extract_ssid(fr, flen, ie_off, ssid, (int)sizeof ssid);
@@ -438,6 +443,7 @@ static void verbose_frame(struct konsole *ks, uint64_t ts_us, uint8_t ch,
         else if (fsub == 4)
             kon_printf(ks, "  ssid=<wildcard>");
     } else if (is_eapol && flen >= 16u) {
+        (void)fc1;
         kon_printf(ks, "  src="); print_mac(ks, fr + 10);
         kon_printf(ks, "  dst="); print_mac(ks, fr +  4);
     }
@@ -449,46 +455,16 @@ static void verbose_frame(struct konsole *ks, uint64_t ts_us, uint8_t ch,
         hexdump_line(ks, off, fr + off, n);
     }
     if (flen > 64u)
-        kon_printf(ks, "    ... (%u bytes total)\r\n", (unsigned)flen);
+        kon_printf(ks, "    ... (%u bytes captured)\r\n", (unsigned)flen);
 }
 
-/* Walk a WIFI_DATA_SNIFF_BLOB payload and call verbose_frame for each record. */
-static void verbose_decode_blob(struct konsole *ks,
-                                const uint8_t *pay, uint16_t pay_len) {
-    if (pay_len < WIFI_BLOB_HDR_SIZE) return;
-    uint8_t  n_frames = pay[2];
-    uint16_t off      = WIFI_BLOB_HDR_SIZE;
-
-    for (int f = 0; f < n_frames; f++) {
-        if (off + WIFI_RECORD_HDR_SIZE > pay_len) break;
-
-        uint64_t ts_us = 0;
-        for (int i = 0; i < 8; i++)
-            ts_us |= (uint64_t)pay[off + i] << (i * 8);
-
-        uint16_t flen   = (uint16_t)pay[off + 8] | ((uint16_t)pay[off + 9] << 8u);
-        uint8_t  fch    = pay[off + 10];
-        int8_t   rssi   = (int8_t)pay[off + 11];
-
-        off += WIFI_RECORD_HDR_SIZE;
-        if (off + flen > pay_len) break;
-
-        verbose_frame(ks, ts_us, fch, rssi, pay + off, flen);
-        off += flen;
-    }
-}
-
-/*
- * Parse "1,6,11", "1-13", or "all" into a channel array (values 1..13).
- * Returns the count written into out[].
- */
+/* Parse "1,6,11", "1-13", or "all" into a channel array (values 1..13). */
 static int parse_channels(const char *s, uint8_t *out, int max) {
     if (!s || strcmp(s, "all") == 0) {
         int n = 0;
         for (int i = 1; i <= 13 && n < max; i++) out[n++] = (uint8_t)i;
         return n;
     }
-    /* Range "a-b" */
     const char *dash = strchr(s, '-');
     if (dash && dash != s) {
         int lo = atoi(s);
@@ -499,7 +475,6 @@ static int parse_channels(const char *s, uint8_t *out, int max) {
         for (int i = lo; i <= hi && n < max; i++) out[n++] = (uint8_t)i;
         return n;
     }
-    /* Comma-separated list */
     char buf[64];
     strncpy(buf, s, sizeof buf - 1);
     buf[sizeof buf - 1] = '\0';
@@ -513,20 +488,250 @@ static int parse_channels(const char *s, uint8_t *out, int max) {
     return n;
 }
 
+struct wifi_telem_snapshot {
+    uint8_t valid;
+    uint8_t version;
+    uint8_t cur_ch;
+    uint8_t running;
+    uint8_t pending;
+    uint8_t fill_idx;
+    uint8_t last_err;
+    uint32_t v[WIFI_TELEM_U32_COUNT];
+};
+
+struct sniff_stat {
+    uint32_t blobs;
+    uint32_t frames;
+    uint32_t bytes;
+    uint32_t telem_rx;
+
+    uint32_t ready_high;
+    uint32_t poll_attempts;
+    uint32_t poll_ok;
+    uint32_t poll_nodata;
+    uint32_t poll_crc;
+    uint32_t poll_magic;
+    uint32_t poll_overflow;
+    uint32_t poll_io;
+    uint32_t poll_timeout;
+    uint32_t poll_other;
+    uint32_t rx_null;
+    uint32_t unexpected_cmd;
+    uint32_t unexpected_data;
+
+    uint32_t bad_blob_short;
+    uint32_t bad_blob_version;
+    uint32_t bad_blob_hdr;
+    uint32_t bad_blob_len;
+    uint32_t bad_record_len;
+    uint32_t blob_seq_gap;
+    uint32_t frame_seq_gap;
+    uint32_t truncated_frames;
+    uint32_t eapol_frames;
+    uint32_t action_send_err;
+
+    uint32_t last_blob_seq;
+    uint32_t last_frame_seq;
+    uint8_t  have_blob_seq;
+    uint8_t  have_frame_seq;
+    uint8_t  cur_ch;
+
+    struct wifi_telem_snapshot tel;
+};
+
+static void count_poll_rc(struct sniff_stat *st, int rc) {
+    if (rc == AWBUS_OK) { st->poll_ok++; return; }
+    if (rc == AWBUS_ERR_NODATA)   st->poll_nodata++;
+    else if (rc == AWBUS_ERR_CRC) st->poll_crc++;
+    else if (rc == AWBUS_ERR_MAGIC) st->poll_magic++;
+    else if (rc == AWBUS_ERR_OVERFLOW) st->poll_overflow++;
+    else if (rc == AWBUS_ERR_IO) st->poll_io++;
+    else if (rc == AWBUS_ERR_TIMEOUT) st->poll_timeout++;
+    else st->poll_other++;
+}
+
+static void process_telem(struct sniff_stat *st, const uint8_t *p, uint16_t len) {
+    if (len < WIFI_TELEMETRY_SIZE || p[0] != WIFI_DATA_TELEMETRY) {
+        st->unexpected_data++;
+        return;
+    }
+    st->telem_rx++;
+    st->tel.valid = 1;
+    st->tel.version = p[1];
+    st->tel.cur_ch = p[3];
+    st->tel.running = p[4];
+    st->tel.pending = p[5];
+    st->tel.fill_idx = p[6];
+    st->tel.last_err = p[7];
+    for (unsigned i = 0; i < WIFI_TELEM_U32_COUNT; i++)
+        st->tel.v[i] = rd32le(p + WIFI_TELEM_HDR_SIZE + i * 4u);
+    st->cur_ch = st->tel.cur_ch;
+}
+
+static void process_blob(struct konsole *ks, struct sniff_stat *st,
+                         const uint8_t *pay, uint16_t pay_len, int verbose) {
+    if (pay_len < WIFI_BLOB_HDR_SIZE) { st->bad_blob_short++; return; }
+    if (pay[0] != WIFI_DATA_SNIFF_BLOB) { st->unexpected_data++; return; }
+    if (pay[1] != WIFI_PROTO_VERSION) st->bad_blob_version++;
+    if (pay[6] != WIFI_BLOB_HDR_SIZE) { st->bad_blob_hdr++; return; }
+
+    uint8_t  n_frames = pay[3];
+    uint8_t  ch       = pay[4];
+    uint32_t blob_seq = rd32le(pay + 8);
+    uint32_t first_seq = rd32le(pay + 12);
+    uint16_t records_len = rd16le(pay + 16);
+
+    st->cur_ch = ch;
+    if (WIFI_BLOB_HDR_SIZE + records_len > pay_len) {
+        st->bad_blob_len++;
+        return;
+    }
+
+    if (st->have_blob_seq && blob_seq != st->last_blob_seq + 1u)
+        st->blob_seq_gap++;
+    st->have_blob_seq = 1;
+    st->last_blob_seq = blob_seq;
+
+    st->blobs++;
+    st->bytes += records_len;
+
+    uint16_t off = WIFI_BLOB_HDR_SIZE;
+    uint8_t parsed = 0;
+    for (uint8_t f = 0; f < n_frames; f++) {
+        if (off + WIFI_RECORD_HDR_SIZE > WIFI_BLOB_HDR_SIZE + records_len) {
+            st->bad_record_len++;
+            break;
+        }
+        const uint8_t *r = pay + off;
+        uint64_t ts_us = rd64le(r + 0);
+        uint32_t frame_seq = rd32le(r + 8);
+        uint16_t flen = rd16le(r + 12);
+        uint16_t orig_len = rd16le(r + 14);
+        uint8_t  fch = r[16];
+        int8_t   rssi = (int8_t)r[17];
+        uint8_t  fc0 = r[18];
+        uint8_t  flags = r[19];
+        off += WIFI_RECORD_HDR_SIZE;
+        if (off + flen > WIFI_BLOB_HDR_SIZE + records_len) {
+            st->bad_record_len++;
+            break;
+        }
+
+        if (st->have_frame_seq && frame_seq != st->last_frame_seq + 1u)
+            st->frame_seq_gap++;
+        st->have_frame_seq = 1;
+        st->last_frame_seq = frame_seq;
+
+        if (flags & WIFI_REC_F_TRUNCATED) st->truncated_frames++;
+        if (flags & WIFI_REC_F_EAPOL) st->eapol_frames++;
+        if (verbose)
+            verbose_frame(ks, frame_seq, ts_us, fch, rssi, fc0, flags,
+                          pay + off, flen, orig_len);
+
+        off = (uint16_t)(off + flen);
+        parsed++;
+    }
+
+    if (first_seq && parsed && !st->have_frame_seq) {
+        (void)first_seq;
+    }
+    st->frames += parsed;
+    if (parsed != n_frames) st->bad_record_len++;
+}
+
+/*
+ * Return value:
+ *   1 = sniff blob consumed
+ *   2 = telemetry consumed
+ *   0 = valid NULL / wake transaction only
+ *  -1 = valid AWBUS frame but not a known sniff payload
+ *
+ * Important: with the ESP-IDF SPI-slave pipeline the companion usually has an
+ * idle RX transaction queued before a spontaneous sniff blob exists.  READY may
+ * therefore mean "send one NULL/wakeup transaction so the companion task can
+ * reap it and queue the DATA_PUSH reply".  The brain must not keep hammering
+ * polls in the same tight loop after receiving AWBUS_CMD_NULL, otherwise the
+ * next SPI transaction can race before the companion has queued the blob.
+ */
+static int process_rx_frame(struct konsole *ks, uint8_t nd, struct sniff_stat *stats,
+                            const awbus_frame_t *rx, int verbose) {
+    struct sniff_stat *st = &stats[nd];
+    if (rx->cmd == AWBUS_CMD_NULL) { st->rx_null++; return 0; }
+    if (rx->cmd != AWBUS_CMD_DATA_PUSH) { st->unexpected_cmd++; return -1; }
+    if (rx->payload_len < 1u) { st->unexpected_data++; return -1; }
+
+    if (rx->payload[0] == WIFI_DATA_SNIFF_BLOB) {
+        process_blob(ks, st, rx->payload, rx->payload_len, verbose);
+        return 1;
+    }
+    if (rx->payload[0] == WIFI_DATA_TELEMETRY) {
+        process_telem(st, rx->payload, rx->payload_len);
+        return 2;
+    }
+
+    st->unexpected_data++;
+    return -1;
+}
+
+static int drain_node(struct konsole *ks, uint8_t nd, struct sniff_stat *stats,
+                      int verbose, int max_polls) {
+    int got = 0;
+    for (int i = 0; i < max_polls; i++) {
+        if (!g_bus.port->ready(g_bus.port->ctx, nd)) break;
+        stats[nd].ready_high++;
+        stats[nd].poll_attempts++;
+        awbus_frame_t rx = {0};
+        int rc = awbus_poll(&g_bus, nd, &rx);
+        count_poll_rc(&stats[nd], rc);
+        if (rc != AWBUS_OK) break;
+        int kind = process_rx_frame(ks, nd, stats, &rx, verbose);
+        got++;
+
+        /*
+         * NULL is a wake/trigger transaction, not a delivered blob.  Give the
+         * companion task one scheduler tick to reap that NULL and queue the
+         * DATA_PUSH descriptor before we poll this node again.  This prevents
+         * READY-level races that show up as crc=0/magic>>0 at the brain.
+         */
+        if (kind <= 0) {
+            A->delay_ms(1);
+            break;
+        }
+    }
+    return got;
+}
+
+static void request_telem(struct konsole *ks, uint8_t nd, struct sniff_stat *stats,
+                          int verbose) {
+    uint8_t req[1] = { WIFI_ACTION_TELEMETRY_REQ };
+    awbus_frame_t rx = {0};
+    int rc = awbus_send(&g_bus, nd, AWBUS_CMD_ACTION, req, 1, &rx);
+    if (rc == AWBUS_OK) {
+        /* The ACTION transaction may clock out a staged DATA_PUSH; do not lose it. */
+        process_rx_frame(ks, nd, stats, &rx, verbose);
+    } else {
+        stats[nd].action_send_err++;
+        count_poll_rc(&stats[nd], rc);
+        return;
+    }
+
+    uint32_t t0 = A->millis();
+    while (A->millis() - t0 < 30u) {
+        int before = (int)stats[nd].telem_rx;
+        drain_node(ks, nd, stats, verbose, 4);
+        if ((int)stats[nd].telem_rx > before) return;
+        A->delay_ms(1);
+    }
+}
+
 /*
  * test-sniff [-v] [channels] [hop_ms=200] [duration_s=10]
  *
- *   -v        : verbose — print decoded frame info + hex dump for every frame
- *   channels  : "1,6,11"  "1-13"  "all"  (default: all, 1-13)
- *   hop_ms    : dwell per channel in ms (default 200)
- *   duration_s: total benchmark duration in seconds (default 10)
- *
- * Splits channels contiguously across online companions, time-syncs each
- * one, starts beacon/probe/EAPOL sniff, polls for blobs, prints live stats
- * every second, then stops and prints a final summary table.
+ * Splits channels contiguously across online companions, time-syncs each one,
+ * starts beacon/probe/EAPOL sniffing, drains blob batches, requests telemetry
+ * once per second, and prints enough counters to localize losses.
  */
 static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
-    /* Scan argv: strip -v, collect up to 3 positional args */
     int   verbose  = 0;
     char *ch_str   = NULL;
     char *hop_str  = NULL;
@@ -539,7 +744,7 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
     }
 
     uint8_t all_ch[13];
-    int n_all = parse_channels(ch_str, all_ch, 13);   /* NULL → "all" 1-13 */
+    int n_all = parse_channels(ch_str, all_ch, 13);
     if (n_all == 0) {
         kon_printf(ks, "test-sniff: no valid channels in '%s'\r\n", ch_str ? ch_str : "?");
         return -1;
@@ -551,7 +756,6 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
     if (duration_s < 1)     duration_s = 10;
     if (duration_s > 3600)  duration_s = 3600;
 
-    /* Collect online companions */
     uint8_t nodes[AWBUS_COMPANION_COUNT];
     int n_nodes = 0;
     for (int i = 1; i <= AWBUS_COMPANION_COUNT; i++)
@@ -562,8 +766,6 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
         return -1;
     }
 
-    /* Split channels contiguously: first (n_all % n_nodes) companions get
-     * one extra channel so every channel is covered exactly once. */
     uint8_t comp_ch[AWBUS_COMPANION_COUNT][13];
     uint8_t comp_n[AWBUS_COMPANION_COUNT];
     {
@@ -579,8 +781,9 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
         }
     }
 
-    kon_printf(ks, "\r\ntest-sniff: %d ch  hop=%dms  dur=%ds  comps=%d\r\n",
-               n_all, hop_ms, duration_s, n_nodes);
+    kon_printf(ks, "\r\ntest-sniff: %d ch  hop=%dms  dur=%ds  comps=%d  blob=%uB snap=%uB\r\n",
+               n_all, hop_ms, duration_s, n_nodes,
+               (unsigned)AWBUS_MAX_PAYLOAD, (unsigned)WIFI_SNIFF_SNAPLEN);
     for (int ni = 0; ni < n_nodes; ni++) {
         kon_printf(ks, "  comp-%d: ", nodes[ni]);
         for (int ci = 0; ci < comp_n[ni]; ci++)
@@ -588,13 +791,17 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
         kon_printf(ks, "\r\n");
     }
 
+    struct sniff_stat stats[AWBUS_COMPANION_COUNT + 1];
+    memset(stats, 0, sizeof stats);
+
     /* --- TIMESYNC each companion --- */
     for (int ni = 0; ni < n_nodes; ni++) {
         uint8_t pay[9];
         pay[0] = WIFI_ACTION_TIMESYNC;
         uint64_t brain_us = (uint64_t)A->millis() * 1000ULL;
         for (int i = 0; i < 8; i++) pay[1 + i] = (uint8_t)(brain_us >> (i * 8));
-        awbus_send(&g_bus, nodes[ni], AWBUS_CMD_ACTION, pay, 9, NULL);
+        int rc = awbus_send(&g_bus, nodes[ni], AWBUS_CMD_ACTION, pay, 9, NULL);
+        if (rc != AWBUS_OK) stats[nodes[ni]].action_send_err++;
         A->delay_ms(5);
     }
 
@@ -610,163 +817,165 @@ static int cmd_test_sniff(struct konsole *ks, int argc, char **argv) {
         for (int ci = 0; ci < comp_n[ni]; ci++) pay[pi++] = comp_ch[ni][ci];
         pay[pi++] = (uint8_t)((uint16_t)hop_ms & 0xFFu);
         pay[pi++] = (uint8_t)((uint16_t)hop_ms >> 8u);
-        awbus_send(&g_bus, nodes[ni], AWBUS_CMD_ACTION, pay, (uint16_t)pi, NULL);
+        int rc = awbus_send(&g_bus, nodes[ni], AWBUS_CMD_ACTION, pay, (uint16_t)pi, NULL);
+        if (rc != AWBUS_OK) stats[nodes[ni]].action_send_err++;
         A->delay_ms(5);
     }
 
     kon_printf(ks, "  running for %d s ...\r\n\r\n", duration_s);
 
-    /* Per-companion accumulators (1-indexed to match node IDs) */
-    struct sniff_stat {
-        uint32_t blobs;
-        uint32_t frames;
-        /* latest telemetry values */
-        uint32_t captured;
-        uint32_t dropped;
-        uint32_t sent;
-        uint32_t hops;
-        uint8_t  cur_ch;
-    } stats[AWBUS_COMPANION_COUNT + 1];
-    memset(stats, 0, sizeof stats);
-
     uint32_t t_start    = A->millis();
     uint32_t t_end      = t_start + (uint32_t)duration_s * 1000u;
     uint32_t t_last_log = t_start;
 
-    /* --- Poll loop --- */
     while (A->millis() < t_end) {
-        for (int ni = 0; ni < n_nodes; ni++) {
-            uint8_t nd = nodes[ni];
-            if (!g_bus.port->ready(g_bus.port->ctx, nd)) continue;
-
-            awbus_frame_t rx = {0};
-            if (awbus_poll(&g_bus, nd, &rx) != AWBUS_OK) continue;
-            if (rx.cmd != AWBUS_CMD_DATA_PUSH || rx.payload_len < 1u) continue;
-
-            if (rx.payload[0] == WIFI_DATA_SNIFF_BLOB && rx.payload_len >= 4u) {
-                stats[nd].blobs++;
-                stats[nd].frames += rx.payload[2];     /* n_frames */
-                stats[nd].cur_ch  = rx.payload[3];     /* cur_channel */
-                if (verbose)
-                    verbose_decode_blob(ks, rx.payload, rx.payload_len);
-            }
-            if (rx.payload[0] == WIFI_DATA_TELEMETRY &&
-                rx.payload_len >= WIFI_TELEMETRY_SIZE) {
-                const uint8_t *p = rx.payload;
-#define RD32(off) ((uint32_t)p[off] | ((uint32_t)p[(off)+1] << 8) \
-                 | ((uint32_t)p[(off)+2] << 16) | ((uint32_t)p[(off)+3] << 24))
-                stats[nd].cur_ch   = p[2];
-                stats[nd].captured = RD32(4);
-                stats[nd].dropped  = RD32(8);
-                stats[nd].sent     = RD32(12);
-                stats[nd].hops     = RD32(16);
-#undef RD32
-            }
-        }
+        for (int ni = 0; ni < n_nodes; ni++)
+            drain_node(ks, nodes[ni], stats, verbose, 6);
 
         uint32_t now = A->millis();
         if (now - t_last_log >= 1000u) {
             t_last_log = now;
+            for (int ni = 0; ni < n_nodes; ni++)
+                request_telem(ks, nodes[ni], stats, verbose);
+
             uint32_t elapsed = (now - t_start) / 1000u;
             kon_printf(ks, "  [%2us]", (unsigned)elapsed);
             for (int ni = 0; ni < n_nodes; ni++) {
                 uint8_t nd = nodes[ni];
+                struct wifi_telem_snapshot *t = &stats[nd].tel;
+                uint32_t cap = t->valid ? t->v[WIFI_TELEM_U32_CAPTURED] : 0;
+                uint32_t drp = t->valid ? t->v[WIFI_TELEM_U32_DROP_TOTAL] : 0;
+                uint32_t ring = t->valid ? (t->v[WIFI_TELEM_U32_DROP_BLOB_FULL] +
+                                            t->v[WIFI_TELEM_U32_DROP_RECORD_LIMIT] +
+                                            t->v[WIFI_TELEM_U32_DROP_MUTEX_BUSY]) : 0;
                 kon_printf(ks,
-                    "  c%d ch%-2d frm=%-5u blobs=%-4u",
+                    "  c%d ch%-2d rx=%-5u cap=%-5u drp=%-4u ring=%-3u spiE=%-2u gap=%-2u",
                     nd, stats[nd].cur_ch,
                     (unsigned)stats[nd].frames,
-                    (unsigned)stats[nd].blobs);
+                    (unsigned)cap,
+                    (unsigned)drp,
+                    (unsigned)ring,
+                    (unsigned)(stats[nd].poll_crc + stats[nd].poll_magic + stats[nd].poll_io + stats[nd].poll_overflow),
+                    (unsigned)(stats[nd].blob_seq_gap + stats[nd].frame_seq_gap));
             }
             kon_printf(ks, "\r\n");
         }
         A->delay_ms(1);
     }
 
+    /* Drain staged blobs before STOP so the STOP transaction does not discard a ready blob. */
+    for (int ni = 0; ni < n_nodes; ni++)
+        drain_node(ks, nodes[ni], stats, verbose, 16);
+
     /* --- SNIFF_STOP all companions --- */
     uint8_t stop_pay[1] = { WIFI_ACTION_SNIFF_STOP };
     for (int ni = 0; ni < n_nodes; ni++) {
-        awbus_send(&g_bus, nodes[ni], AWBUS_CMD_ACTION, stop_pay, 1, NULL);
-        A->delay_ms(5);
-        /* Collect the telemetry DATA_PUSH companions push on STOP */
+        uint8_t nd = nodes[ni];
+        awbus_frame_t rx = {0};
+        int rc = awbus_send(&g_bus, nd, AWBUS_CMD_ACTION, stop_pay, 1, &rx);
+        if (rc == AWBUS_OK) process_rx_frame(ks, nd, stats, &rx, verbose);
+        else { stats[nd].action_send_err++; count_poll_rc(&stats[nd], rc); }
+
         uint32_t t0 = A->millis();
-        while (A->millis() - t0 < 100u) {
-            if (!g_bus.port->ready(g_bus.port->ctx, nodes[ni])) { A->delay_ms(1); continue; }
-            awbus_frame_t rx = {0};
-            if (awbus_poll(&g_bus, nodes[ni], &rx) != AWBUS_OK) break;
-            if (rx.cmd == AWBUS_CMD_DATA_PUSH &&
-                rx.payload[0] == WIFI_DATA_TELEMETRY &&
-                rx.payload_len >= WIFI_TELEMETRY_SIZE) {
-                const uint8_t *p = rx.payload;
-#define RD32(off) ((uint32_t)p[off] | ((uint32_t)p[(off)+1] << 8) \
-                 | ((uint32_t)p[(off)+2] << 16) | ((uint32_t)p[(off)+3] << 24))
-                uint8_t nd = nodes[ni];
-                stats[nd].cur_ch   = p[2];
-                stats[nd].captured = RD32(4);
-                stats[nd].dropped  = RD32(8);
-                stats[nd].sent     = RD32(12);
-                stats[nd].hops     = RD32(16);
-#undef RD32
-                break;
-            }
+        while (A->millis() - t0 < 150u) {
+            uint32_t before = stats[nd].telem_rx;
+            drain_node(ks, nd, stats, verbose, 8);
+            if (stats[nd].telem_rx > before) break;
+            A->delay_ms(1);
         }
     }
 
-    /* Drain any final blobs */
+    /* Final drain, including remaining sniff blobs sealed by STOP. */
     A->delay_ms(100);
+    for (int ni = 0; ni < n_nodes; ni++)
+        drain_node(ks, nodes[ni], stats, verbose, 32);
+    for (int ni = 0; ni < n_nodes; ni++)
+        request_telem(ks, nodes[ni], stats, verbose);
+
+    /* --- Final summaries --- */
+    kon_printf(ks, "\r\nCAPTURE PATH\r\n");
+    kon_printf(ks, "  %-6s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s\r\n",
+               "comp", "seenM", "seenD", "filter", "cap", "sent", "drop", "blobF", "pend", "pushF");
+    kon_printf(ks, "  %-6s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s\r\n",
+               "──────", "───────", "───────", "───────", "───────", "───────", "───────", "───────", "───────", "───────");
+    uint32_t total_frames = 0, total_blobs = 0, total_drop = 0;
     for (int ni = 0; ni < n_nodes; ni++) {
-        for (int drain = 0; drain < 16; drain++) {
-            if (!g_bus.port->ready(g_bus.port->ctx, nodes[ni])) break;
-            awbus_frame_t rx = {0};
-            if (awbus_poll(&g_bus, nodes[ni], &rx) != AWBUS_OK) break;
-            if (rx.cmd == AWBUS_CMD_DATA_PUSH && rx.payload_len >= 4u &&
-                rx.payload[0] == WIFI_DATA_SNIFF_BLOB) {
-                stats[nodes[ni]].blobs++;
-                stats[nodes[ni]].frames  += rx.payload[2];
-                stats[nodes[ni]].cur_ch   = rx.payload[3];
-                if (verbose)
-                    verbose_decode_blob(ks, rx.payload, rx.payload_len);
-            }
-        }
+        uint8_t nd = nodes[ni];
+        struct wifi_telem_snapshot *t = &stats[nd].tel;
+        uint32_t seenM = t->valid ? t->v[WIFI_TELEM_U32_SEEN_MGMT] : 0;
+        uint32_t seenD = t->valid ? t->v[WIFI_TELEM_U32_SEEN_DATA] : 0;
+        uint32_t filt  = t->valid ? t->v[WIFI_TELEM_U32_FILTERED] : 0;
+        uint32_t cap   = t->valid ? t->v[WIFI_TELEM_U32_CAPTURED] : 0;
+        uint32_t sent  = t->valid ? t->v[WIFI_TELEM_U32_SENT] : 0;
+        uint32_t drop  = t->valid ? t->v[WIFI_TELEM_U32_DROP_TOTAL] : 0;
+        uint32_t blobF = t->valid ? t->v[WIFI_TELEM_U32_DROP_BLOB_FULL] : 0;
+        uint32_t pend  = t->valid ? t->v[WIFI_TELEM_U32_DROP_PENDING_BUSY] : 0;
+        uint32_t pushF = t->valid ? t->v[WIFI_TELEM_U32_DROP_PUSH_FAIL] : 0;
+        kon_printf(ks, "  comp-%-1d %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u\r\n",
+                   nd, (unsigned)seenM, (unsigned)seenD, (unsigned)filt,
+                   (unsigned)cap, (unsigned)sent, (unsigned)drop,
+                   (unsigned)blobF, (unsigned)pend, (unsigned)pushF);
+        total_frames += stats[nd].frames;
+        total_blobs  += stats[nd].blobs;
+        total_drop   += drop;
     }
 
-    /* --- Final summary --- */
-    kon_printf(ks, "\r\n");
-    kon_printf(ks, "  %-6s  %-8s  %-8s  %-8s  %-6s  %-8s  %-6s\r\n",
-               "comp", "captured", "dropped", "frames", "drop%", "blobs", "hops");
-    kon_printf(ks, "  %-6s  %-8s  %-8s  %-8s  %-6s  %-8s  %-6s\r\n",
-               "──────", "────────", "────────", "────────", "──────", "────────", "──────");
-
-    uint32_t total_cap = 0, total_drp = 0, total_frm = 0, total_blobs = 0;
+    kon_printf(ks, "\r\nFRAME MIX / HOPPER\r\n");
+    kon_printf(ks, "  %-6s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s\r\n",
+               "comp", "beacon", "preq", "prsp", "eapol", "trunc", "hops", "chOK", "chERR", "lastE");
     for (int ni = 0; ni < n_nodes; ni++) {
-        uint8_t nd  = nodes[ni];
-        uint32_t cap = stats[nd].captured;
-        uint32_t drp = stats[nd].dropped;
-        uint32_t tot = cap + drp;
-        uint32_t pct = tot > 0u ? drp * 100u / tot : 0u;
-        kon_printf(ks, "  comp-%-1d  %-8u  %-8u  %-8u  %3u%%   %-8u  %-6u\r\n",
-                   nd, (unsigned)cap, (unsigned)drp,
-                   (unsigned)stats[nd].frames, (unsigned)pct,
-                   (unsigned)stats[nd].blobs, (unsigned)stats[nd].hops);
-        total_cap   += cap;
-        total_drp   += drp;
-        total_frm   += stats[nd].frames;
-        total_blobs += stats[nd].blobs;
+        uint8_t nd = nodes[ni];
+        struct wifi_telem_snapshot *t = &stats[nd].tel;
+        kon_printf(ks, "  comp-%-1d %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7d\r\n",
+                   nd,
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_KEPT_BEACON] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_KEPT_PROBE_REQ] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_KEPT_PROBE_RSP] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_KEPT_EAPOL] : 0),
+                   (unsigned)stats[nd].truncated_frames,
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_HOP_COUNT] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_CHANNEL_SET_OK] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_CHANNEL_SET_ERR] : 0),
+                   (int)(int8_t)(t->valid ? t->last_err : 0));
     }
 
-    kon_printf(ks, "  %-6s  %-8s  %-8s  %-8s  %-6s  %-8s\r\n",
-               "──────", "────────", "────────", "────────", "──────", "────────");
-    uint32_t tot = total_cap + total_drp;
-    uint32_t pct = tot > 0u ? total_drp * 100u / tot : 0u;
-    kon_printf(ks, "  %-6s  %-8u  %-8u  %-8u  %3u%%   %-8u\r\n",
-               "total",
-               (unsigned)total_cap, (unsigned)total_drp,
-               (unsigned)total_frm, (unsigned)pct,
-               (unsigned)total_blobs);
+    kon_printf(ks, "\r\nBLOB / SPI RECEIVE\r\n");
+    kon_printf(ks, "  %-6s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s\r\n",
+               "comp", "blobs", "frames", "bytes", "poll", "null", "crc", "magic", "seqGap", "badRec");
+    for (int ni = 0; ni < n_nodes; ni++) {
+        uint8_t nd = nodes[ni];
+        kon_printf(ks, "  comp-%-1d %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u\r\n",
+                   nd, (unsigned)stats[nd].blobs, (unsigned)stats[nd].frames,
+                   (unsigned)stats[nd].bytes, (unsigned)stats[nd].poll_attempts,
+                   (unsigned)stats[nd].rx_null, (unsigned)stats[nd].poll_crc,
+                   (unsigned)stats[nd].poll_magic,
+                   (unsigned)(stats[nd].blob_seq_gap + stats[nd].frame_seq_gap),
+                   (unsigned)(stats[nd].bad_blob_short + stats[nd].bad_blob_len + stats[nd].bad_record_len));
+    }
+
+    kon_printf(ks, "\r\nBUFFER HIGHS / FLUSH\r\n");
+    kon_printf(ks, "  %-6s %-7s %-7s %-7s %-7s %-7s %-7s %-7s %-7s\r\n",
+               "comp", "maxBlob", "maxBF", "maxFill", "maxFF", "flush", "pop", "timer", "empty");
+    for (int ni = 0; ni < n_nodes; ni++) {
+        uint8_t nd = nodes[ni];
+        struct wifi_telem_snapshot *t = &stats[nd].tel;
+        kon_printf(ks, "  comp-%-1d %-7u %-7u %-7u %-7u %-7u %-7u %-7u %-7u\r\n",
+                   nd,
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_MAX_BLOB_BYTES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_MAX_BLOB_FRAMES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_MAX_FILL_BYTES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_MAX_FILL_FRAMES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_BLOB_FLUSHES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_BLOB_POPPED] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_FLUSH_TIMER_FIRES] : 0),
+                   (unsigned)(t->valid ? t->v[WIFI_TELEM_U32_FLUSH_EMPTY] : 0));
+    }
 
     uint32_t elapsed_s = ((A->millis() - t_start) + 500u) / 1000u;
     if (elapsed_s > 0u) {
-        kon_printf(ks, "\r\n  frames/s: %u  blobs/s: %u\r\n",
-                   (unsigned)(total_frm  / elapsed_s),
+        kon_printf(ks, "\r\n  total frames=%u blobs=%u drops=%u  frames/s=%u blobs/s=%u\r\n",
+                   (unsigned)total_frames, (unsigned)total_blobs, (unsigned)total_drop,
+                   (unsigned)(total_frames / elapsed_s),
                    (unsigned)(total_blobs / elapsed_s));
     }
 

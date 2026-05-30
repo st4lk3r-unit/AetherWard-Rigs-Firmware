@@ -32,6 +32,7 @@ int wifi_sniff_flush(awbus_t *bus);
  * Returns 1 if a reply was queued, 0 if nothing was pending. */
 int wifi_sniff_pop_pending(awbus_t *bus);
 
-/* Write a WIFI_DATA_TELEMETRY payload into buf[WIFI_TELEMETRY_SIZE].
+/* Write a versioned WIFI_DATA_TELEMETRY payload into buf[WIFI_TELEMETRY_SIZE].
+ * Includes capture/filter/drop/blob/channel counters for test-sniff.
  * Returns WIFI_TELEMETRY_SIZE. */
 uint16_t wifi_sniff_telemetry(uint8_t *buf);
